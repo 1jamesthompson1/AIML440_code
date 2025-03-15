@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "aiml440-code"
+version = "0.1.0"
+description = "Experiments and code for AIML440 project"
+authors = ["1jamesthompson1 <1jamesthompson1@gmail.com>"]
+license = "GNU General Public License v3.0"
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+ipykernel = "^6.29.5"
+numpy = "^2.2.3"
+pandas = "^2.2.3"
+torch = "^2.6.0"
+swig = "^4.3.0"
+gymnasium = {extras = ["mujoco"], version = "^1.1.1"}
+matplotlib = "^3.10.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
