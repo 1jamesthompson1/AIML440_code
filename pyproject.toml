@@ -7,13 +7,12 @@ package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.11"
-ipykernel = "^6.29.5"
 numpy = "^2.2.3"
 pandas = "^2.2.3"
 torch = "^2.6.0"
 swig = "^4.3.0"
 matplotlib = "^3.10.1"
-pyvirtualdisplay = "^3.0"
+jupyter = "^1.1.1"
 
 
 [build-system]
