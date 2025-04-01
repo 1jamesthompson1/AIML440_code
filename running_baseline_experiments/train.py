@@ -58,7 +58,6 @@ envs = [
 ]
 
 os.makedirs("models", exist_ok=True)
-os.makedirs("logs/avg_reward", exist_ok=True)
 
 env = envs[args.env_index]
 

@@ -19,6 +19,8 @@ ipykernel = "^6.29.5"
 generals-bots = "^2.2.1"
 stable-baselines3 = {extras = ["extra"], version = "^2.5.0"}
 tqdm = "^4.67.1"
+notebook = "^7.3.3"
+cython = "^3.0.12"
 
 
 [build-system]
