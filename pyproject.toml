@@ -21,6 +21,8 @@ stable-baselines3 = {extras = ["extra"], version = "^2.5.0"}
 tqdm = "^4.67.1"
 notebook = "^7.3.3"
 cython = "^3.0.12"
+sbx-rl = "^0.20.0"
+jax = {extras = ["cuda12"], version = "^0.5.3"}
 
 
 [build-system]
