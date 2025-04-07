@@ -29,7 +29,7 @@ def main():
         "ppo": partial(PPO, "MlpPolicy", learning_rate=0.0003, n_steps=2048, batch_size=64, n_epochs=10, gamma=0.99, gae_lambda=0.95),
         "sac": partial(SAC, "MlpPolicy", learning_rate=0.0003, buffer_size=1000000, learning_starts=100, batch_size=256, tau=0.005, gamma=0.99, train_freq=1, gradient_steps=1),
         "td3": partial(TD3, "MlpPolicy", learning_rate=0.001, buffer_size=1000000, learning_starts=1000, batch_size=100, tau=0.005, gamma=0.99, train_freq=1, policy_delay=2, target_policy_noise=0.2, target_noise_clip=0.5, gradient_steps=1),
-        "crossq": partial(CrossQ, "MlpPolicy"),
+        "crossq": partial(CrossQ, "MlpPolicy", policy_kwargs={"net_arch": {"pi": [256, 256], "qf": [2048, 2048]}}),
         "droq": partial(SBX_SAC, "MlpPolicy", learning_rate=0.003, buffer_size=1000000, learning_starts=0, gradient_steps=20, policy_delay=20, policy_kwargs={"dropout_rate": 0.01, "layer_norm":True}),
     }
 

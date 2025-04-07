@@ -12,7 +12,7 @@ runs_per_algo=$(($num_seeds * $num_envs))
 seed=$(($task_id % $num_seeds))
 env_index=$(( (($task_id % $runs_per_algo) / $num_seeds) % $num_seeds))
 
-envs=("HalfCheetah-v5" "Walker2d-v5" "Humanoid-v5" "Ant-v5" "Humanoid-v5" "Swimmer-v5" "Hopper-v5" "InvertedDoublePendulum-v5" "Pusher-v5")
+envs=("HalfCheetah-v5" "Walker2d-v5" "Humanoid-v5" "Ant-v5" "HumanoidStandup-v5" "Swimmer-v5" "Hopper-v5" "InvertedDoublePendulum-v5" "Pusher-v5")
 
 selected_env=${envs[$env_index]}
 
