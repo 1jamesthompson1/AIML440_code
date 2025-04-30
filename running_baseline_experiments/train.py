@@ -49,7 +49,7 @@ def main():
     parser.add_argument('--seed', required=True, type=int, help='Random seed for reproducibility')
     parser.add_argument('--algo', required=True, type=str, choices=algorithms.keys() ,help='Algorithm to use for training')
     parser.add_argument('--env_index', required=True, type=int, help='Environment to train on')
-    parser.add_argument('--time_steps', default=1e6, type=int, help='Number of time steps to train the model')
+    parser.add_argument('--time_steps', default=1_000_000, type=int, help='Number of time steps to train the model')
 
     ## Output
     parser.add_argument('--output_dir', type=str, required=True, help='Output directory for the model')
