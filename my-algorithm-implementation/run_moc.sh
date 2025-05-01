@@ -25,5 +25,5 @@ training_script=$2/train.py
 
 echo "==Running ${training_script}=="
 
-poetry run python ${training_script} --seed=${seed} --data-dir=$OUTPUTDIR --env=${selected_env}
+poetry run python ${training_script} --seed=${seed} --data-dir=$OUTPUTDIR --env=${selected_env} "${@:3}"
 echo "==${training_script} Complete=="

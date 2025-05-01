@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -159,39 +160,6 @@ class PolicyNetwork(nn.Module):
         return Normal(mean, std)
 
 
-# --- Aggregation Function ---
-def aggregate_actions_max_q(
-    state: torch.Tensor, actors: List[PolicyNetwork], critics: List[ValueNetwork]
-) -> Tuple[torch.Tensor, int, List[torch.Tensor]]:
-    """
-    Selects action based on the highest minimum Q-value estimate.
-    Args:
-        state: Current state tensor (batch size 1).
-        actors: List of PolicyNetwork instances.
-        critics: List of two ValueNetwork instances [critic1, critic2].
-    Returns:
-        action: The selected action tensor.
-        policy_index: The index of the actor whose action was selected.
-        all_actions: List of actions proposed by each actor.
-    """
-    with torch.no_grad():
-        all_actions: List[torch.Tensor] = []
-        min_q_values: List[torch.Tensor] = []
-        for actor in actors:
-            action, _, _ = actor.sample(state)
-            q1 = critics[0](state, action)
-            q2 = critics[1](state, action)
-            min_q = torch.min(q1, q2)
-            all_actions.append(action)
-            min_q_values.append(min_q)
-
-        min_q_tensor = torch.cat(min_q_values, dim=1)  # Shape: (1, num_actors)
-        best_actor_idx: int = int(torch.argmax(min_q_tensor, dim=1).item())
-        selected_action = all_actions[best_actor_idx]
-
-    return selected_action, best_actor_idx, all_actions
-
-
 # --- SnAC Agent ---
 class SnAC:
     DEVICE: torch.device
@@ -219,11 +187,13 @@ class SnAC:
     alpha_optimizer: Optional[optim.Optimizer]  # Can be None if auto_entropy is False
     memory: ReplayBuffer
     updates: int
+    aggregation_method: str
 
     def __init__(
         self,
         env: gym.Env,
         num_actors: int = 3,
+        aggregation_method: str = "max_q",
         gamma: float = 0.99,
         tau: float = 0.005,
         lr_q: float = 3e-4,
@@ -248,6 +218,16 @@ class SnAC:
         self.update_every = update_every
         self.batch_size = batch_size
         self.num_actors = num_actors
+
+        self.supported_aggregation_methods = [
+            "elementwise",
+            "weighted_elementwise",
+            "max_q",
+        ]
+        assert aggregation_method in self.supported_aggregation_methods, (
+            f"Aggregation method must be one of {self.supported_aggregation_methods}"
+        )
+        self.aggregation_method = aggregation_method
 
         # Type assertion for action_space if needed, or handle different space types
         assert isinstance(env.action_space, gym.spaces.Box), (
@@ -318,12 +298,73 @@ class SnAC:
     ) -> Tuple[np.ndarray, int]:
         state_tensor = torch.FloatTensor(state).to(self.DEVICE).unsqueeze(0)
 
-        # TODO: handle multiple aggregation methods
-        action, policy_index, _ = aggregate_actions_max_q(
-            state_tensor, self.actors, [self.critic1, self.critic2]
-        )
+        with torch.no_grad():
+            all_actions: List[torch.Tensor] = []
+            min_q_values: List[torch.Tensor] = []
+            for actor in self.actors:
+                action, _, _ = actor.sample(state_tensor)
+                q1 = self.critic1(state_tensor, action)
+                q2 = self.critic2(state_tensor, action)
+                min_q = torch.min(q1, q2)
+                all_actions.append(action)
+                min_q_values.append(min_q)
+        
+        selected_action, policy_index = self.aggregate_actions(
+            all_actions, min_q_values
+        ) 
 
-        return action.detach().cpu().numpy()[0], policy_index
+        return selected_action.detach().cpu().numpy()[0], policy_index
+
+    def aggregate_actions(
+            self, actions: List[torch.Tensor], action_values: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Selects a naction based on the aggregation method of the class.
+
+        Args:
+            actions: List of actions proposed by each actor.
+            values: List of Q-values for each action.
+        Returns:
+            action: The selected action tensor.
+            policy_index: The index of the actor whose action was selected. Note that for averaging methods it uses the actor that was closest to the average.
+        """
+        best_actor_idx: int = -1 # Initialize with a default
+
+        if self.aggregation_method in ["elementwise", "weighted_elementwise"]:
+            selected_action: torch.Tensor # Declare type hint
+            if self.aggregation_method == "elementwise":
+                # Element-wise average of actions
+                selected_action = torch.mean(torch.stack(actions), dim=0)
+            elif self.aggregation_method == "weighted_elementwise":
+                # Weighted average of actions based on Q-values
+                # Ensure values are positive for softmax weighting, add small epsilon for stability
+                value_stack = torch.stack(action_values)
+                shifted_values = value_stack - value_stack.min() + 1e-6
+                weights = F.softmax(shifted_values, dim=0)
+                selected_action = torch.sum(
+                    torch.stack(actions) * weights, dim=0
+                )
+
+
+            normalized_actions = [F.normalize(action, p=2, dim=-1) for action in actions]
+            normalized_selection = F.normalize(selected_action, p=2, dim=-1)
+            similarities = [torch.sum(action * normalized_selection, dim=-1) for action in normalized_actions]
+            # Find the index of the maximum similarity
+            best_actor_idx = int(torch.argmax(torch.stack(similarities)).item())
+
+
+        elif self.aggregation_method == "max_q":
+            best_actor_idx = int(torch.argmax(
+                torch.stack(action_values, dim=0)
+            ).item())
+            selected_action = actions[best_actor_idx]
+        else:
+            raise ValueError(
+                f"Unknown aggregation method: {self.aggregation_method}. Use 'elementwise', 'weighted_elementwise', or 'max_q'."
+            )
+
+
+        return selected_action, best_actor_idx
 
     def update_parameters(self, updates_per_step: int) -> None:
         if len(self.memory) < self.batch_size:
@@ -351,30 +392,32 @@ class SnAC:
 
             # --- Critic Update ---
             with torch.no_grad():
-                next_actions_list: List[torch.Tensor] = []
-                next_log_probs_list: List[torch.Tensor] = []
-                for i in range(self.batch_size):
-                    idx: int = int(policy_indices[i].item())
-                    if idx < 0 or idx >= self.num_actors:
-                        # Handle cases where policy_index might be invalid (e.g., random actions)
-                        # Option 1: Skip this sample (might introduce bias)
-                        # Option 2: Use a default actor (e.g., actor 0)
-                        # Option 3: Re-sample action (complex)
-                        # Option 4: Randomly select an actor from the available ones
-                        # Using actor 0 as a fallback for now:
-                        idx = 0
-                    next_state_i = next_state_batch[i].unsqueeze(0)
-                    next_action_i, next_log_prob_i, _ = self.actors[idx].sample(
-                        next_state_i
-                    )
-                    next_actions_list.append(next_action_i)
-                    next_log_probs_list.append(next_log_prob_i)
+                all_next_actions = []
+                all_next_log_probs = []
+                for actor in self.actors:
+                    next_action_batch, next_log_prob_batch, _ = actor.sample(next_state_batch)
+                    all_next_actions.append(next_action_batch)
+                    all_next_log_probs.append(next_log_prob_batch)
 
-                if not next_actions_list:
-                    continue  # Skip update if no valid samples from indexing problems
+                stacked_next_actions = torch.stack(all_next_actions)
+                stacked_next_log_probs = torch.stack(all_next_log_probs)
 
-                next_state_action = torch.cat(next_actions_list)
-                next_state_log_pi = torch.cat(next_log_probs_list)
+                # Handle cases where policy_index is -1 (random actions during start_steps)
+                # Currently handles them by assigning them a zero.
+                # Another option could be to instead randomly generate a policy index.
+                random_action_mask = (policy_indices == -1)
+                policy_indices_for_gather = policy_indices.clone()
+                policy_indices_for_gather[random_action_mask] = 0
+
+                idx_expanded_log_prob = policy_indices_for_gather.view(1, self.batch_size, 1).expand(-1, -1, stacked_next_log_probs.shape[-1])
+                idx_expanded_action = policy_indices_for_gather.view(1, self.batch_size, 1).expand(-1, -1, stacked_next_actions.shape[-1])
+
+                next_state_action = torch.gather(stacked_next_actions, 0, idx_expanded_action).squeeze(0)
+                next_state_log_pi = torch.gather(stacked_next_log_probs, 0, idx_expanded_log_prob).squeeze(0)
+
+                # Set log_pi to 0 for transitions where the original action was random
+                # This effectively removes the entropy bonus for these steps in the target Q calculation
+                next_state_log_pi[random_action_mask.unsqueeze(1)] = 0.0
 
                 qf1_next_target = self.critic1_target(
                     next_state_batch, next_state_action
@@ -479,7 +522,7 @@ class SnAC:
             save_dict["log_alpha"] = self.log_alpha
             save_dict["alpha_optimizer_state_dict"] = self.alpha_optimizer.state_dict()
 
-        torch.save(save_dict, f"{path}_snac.pt")
+        torch.save(save_dict, path)
 
     def load_model(self, path: str) -> None:
         # Specify map_location type

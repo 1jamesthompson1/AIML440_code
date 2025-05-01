@@ -7,13 +7,12 @@ import time
 import random
 import gymnasium as gym
 import os.path as osp
+import re
+import subprocess
 
 
-from SnAC import SnAC
+from snac import SnAC
 
-# --- Configuration ---
-DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DEVICE: torch.device = torch.device("cpu")
 
 def train_snac(
     env_name: str,
@@ -67,7 +66,7 @@ def train_snac(
         memory_size=memory_size,
         hidden_dim=hidden_dim,
         auto_entropy=auto_entropy,
-        target_update_interval=updates_per_step,
+        target_update_interval=1,
         computation_device=DEVICE,
     )
 
@@ -167,11 +166,11 @@ def train_snac(
             )
 
             if save_model: # Use save_model parameter
-                agent.save_model(f"{save_model_path}")
+                agent.save_model(osp.join(save_model_path, f"{experiment_name}.pt"))
 
     env.close()
     print("Training finished.")
-    agent.save_model(f"{save_model_path}_final")
+    agent.save_model(osp.join(save_model_path, f"{experiment_name}_final.pt"))
 
 
 def evaluate_model(env_name: str, agent: SnAC, seed: int, num_episodes: int=10, max_steps: int=1000):
@@ -323,7 +322,7 @@ See the experiments direcotry of this project to see how I ran experiments using
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=10000, # Corrected default value based on help text
+        default=1_000, # Corrected default value based on help text
         metavar="N",
         help="Evaluate policy every N steps (default: 10000)",
     )
@@ -374,11 +373,69 @@ See the experiments direcotry of this project to see how I ran experiments using
         default="snac_model",
         help="Path prefix to save models (default: snac_model)",
     )
+    parser.add_argument(
+        "--computation-device",
+        type=str,
+        default="auto",
+        help="What device to run the tranining process. Auto will use cuda if available otherwise use cpu, it will search for a cuda device that is not in use."
+    )
 
 
     args = parser.parse_args()
 
     experiment_name = f"snac_{args.env_name}_{args.time_steps}_{args.seed}"
+
+    # --- Configuration ---
+    DEVICE: torch.device
+    if args.computation_device == "auto":
+        print("Automatically figuring out which GPU to use.")
+        if torch.cuda.is_available():
+            try:
+                # Try to find the least utilized GPU
+                result = subprocess.run(
+                    ['nvidia-smi', '--query-gpu=index,memory.used', '--format=csv,noheader,nounits'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+                )
+                gpus = []
+                for line in result.stdout.strip().split('\n'):
+                    index, memory_used = map(int, line.split(', '))
+                    gpus.append({'index': index, 'memory_used': memory_used})
+
+                print(f"GPUs available are:\n{gpus}")
+
+                if gpus:
+                    gpus.sort(key=lambda x: x['memory_used'])
+                    best_gpu = gpus[0]
+                    # Ignoring GPUs that have more than 10mb of memory used based on the heuristic that that would make them 'occupied'
+                    if best_gpu['memory'] > 10:
+                       print("All GPUs are occupied, using cpu") 
+                       DEVICE = torch.device("cpu")
+                    else:
+                        DEVICE = torch.device(f"cuda:{best_gpu['index']}")
+                        print(f"Auto-selected CUDA device: cuda:{best_gpu['index']}")
+                else:
+                    print("nvidia-smi found no GPUs, defaulting to cuda:0")
+                    DEVICE = torch.device("cuda:0")
+
+            except (FileNotFoundError, subprocess.CalledProcessError, Exception) as e:
+                print(f"Could not run nvidia-smi or parse output ({e}), defaulting to cuda:0")
+                DEVICE = torch.device("cuda:0")
+        else:
+            print("CUDA not available, using CPU.")
+            DEVICE = torch.device("cpu")
+    else:
+        try:
+            DEVICE = torch.device(args.computation_device)
+            print(f"Using specified device: {DEVICE}")
+        except RuntimeError as e:
+            print(f"Error setting device to '{args.computation_device}': {e}.")
+            exit(1)
+
+
+    eval_dir = osp.join(args.data_dir, args.eval_dir)
+    save_model_path = osp.join(args.data_dir, args.save_model_path)
+    Path(eval_dir).mkdir(parents=True, exist_ok=True)
+    Path(save_model_path).mkdir(parents=True, exist_ok=True)
 
     train_snac(
         env_name=args.env_name,
@@ -398,8 +455,8 @@ See the experiments direcotry of this project to see how I ran experiments using
         time_steps=args.time_steps,
         start_steps=args.start_steps,
         eval_every=args.eval_every,
-        eval_dir=osp.join(args.data_dir, args.eval_dir),
+        eval_dir=eval_dir,
         save_model=args.save_model,
-        save_model_path=osp.join(args.data_dir, args.save_model_path),
+        save_model_path=save_model_path,
         experiment_name=experiment_name,
     )
