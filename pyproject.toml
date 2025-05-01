@@ -25,6 +25,9 @@ sbx-rl = "^0.20.0"
 jax = {extras = ["cuda12"], version = "^0.5.3"}
 
 
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.11.7"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
