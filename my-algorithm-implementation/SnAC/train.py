@@ -7,7 +7,6 @@ import time
 import random
 import gymnasium as gym
 import os.path as osp
-import re
 import subprocess
 
 
@@ -16,17 +15,7 @@ from snac import SnAC
 
 def train_snac(
     env_name: str,
-    num_actors: int,
-    gamma: float,
-    tau: float,
-    lr_q: float,
-    lr_pi: float,
-    lr_alpha: float,
-    alpha_div: float,
-    batch_size: int,
-    memory_size: int,
-    hidden_dim: int,
-    auto_entropy: bool,
+    agent_params: dict,
     updates_per_step: int,
     seed: int,
     time_steps: int,
@@ -36,6 +25,7 @@ def train_snac(
     save_model: bool,
     save_model_path: str,
     experiment_name: str,
+    computation_device: torch.device
 ):
     """
     Trains the Soft n Actor-Critic (SnAC) algorithm on a specified environment.
@@ -44,7 +34,7 @@ def train_snac(
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if DEVICE == torch.device("cuda"):
+    if computation_device == torch.device("cuda"):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)  # if using multiple GPUs
         # Potentially add deterministic flags, though they can impact performance
@@ -55,19 +45,9 @@ def train_snac(
 
     agent = SnAC(
         env,
-        num_actors=num_actors,
-        gamma=gamma,
-        tau=tau,
-        lr_q=lr_q,
-        lr_pi=lr_pi,
-        lr_alpha=lr_alpha,
-        alpha_div=alpha_div,
-        batch_size=batch_size,
-        memory_size=memory_size,
-        hidden_dim=hidden_dim,
-        auto_entropy=auto_entropy,
+        **agent_params,
         target_update_interval=1,
-        computation_device=DEVICE,
+        computation_device=computation_device,
     )
 
     state_tuple: Tuple[np.ndarray, dict] = env.reset(seed=seed)
@@ -87,10 +67,10 @@ def train_snac(
     
     print ("Training parameters:")
     print(f"Environment: {env_name}")
-    print(f"Device: {DEVICE}")
+    print(f"Device: {computation_device}")
     print(f"Environment name: {env_name}")
-    print(f"Parameters: num_actors={num_actors}, gamma={gamma}, tau={tau}, lr_q={lr_q}, lr_pi={lr_pi}, lr_alpha={lr_alpha}, alpha_div={alpha_div}, batch_size={batch_size}, memory_size={memory_size}, hidden_dim={hidden_dim}, auto_entropy={auto_entropy}, updates_per_step={updates_per_step}, seed={seed}, time_steps={time_steps}, start_steps={start_steps}, eval_every={eval_every}, eval_dir={eval_dir}, save_model={save_model}, save_model_path={save_model_path}, experiment_name={experiment_name}")
     print(f"Start time of training: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(episode_start_time))}")
+    print(f"Using settings: updates_per_step={updates_per_step}, seed={seed}, time_steps={time_steps}, start_steps={start_steps}, eval_every={eval_every}, eval_dir={eval_dir},  save_model={save_model}, save_model_path={save_model_path}, experiment_name={experiment_name}")
 
 
     for frame_idx in range(1, time_steps + 1):
@@ -220,6 +200,106 @@ def evaluate_model(env_name: str, agent: SnAC, seed: int, num_episodes: int=10, 
 
     return curr_eval_rewards, curr_eval_ep_lengths
 
+def get_available_computation_device(min_free_memory_mib=1024, max_utilization_pct=99, power_margin_pct=10):
+    """
+    Checks for computation devices and selects the most suitable CUDA device based on utilization,
+    memory availability, and power usage.
+
+    Args:
+        min_free_memory_mib (int): Minimum free memory required in MiB.
+        max_utilization_pct (int): Maximum GPU utilization percentage allowed.
+        power_margin_pct (int): Required power headroom percentage (e.g., 10 means power draw must be < 90% of limit).
+
+    Returns:
+        torch.device: The selected computation device (CPU or a specific CUDA device).
+    """
+    print("Automatically figuring out which GPU to use.")
+    if not torch.cuda.is_available():
+        print("CUDA not available, using CPU.")
+        return torch.device("cpu")
+
+    try:
+        # Query relevant GPU properties
+        query_fields = "index,memory.used,memory.total,utilization.gpu,power.draw,power.limit"
+        result = subprocess.run(
+            ['nvidia-smi', f'--query-gpu={query_fields}', '--format=csv,noheader,nounits'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+        )
+
+        gpus = []
+        for line in result.stdout.strip().split('\n'):
+            if not line: continue
+            try:
+                # Parse values, handling potential missing data or formatting issues
+                parts = line.split(', ')
+                if len(parts) != 6:
+                    print(f"Warning: Skipping malformed nvidia-smi line: {line}")
+                    continue
+
+                index = int(parts[0])
+                memory_used = int(parts[1])
+                memory_total = int(parts[2])
+                utilization_gpu = int(parts[3])
+                power_draw = float(parts[4])
+                power_limit = float(parts[5])
+
+                gpus.append({
+                    'index': index,
+                    'memory_used': memory_used,
+                    'memory_total': memory_total,
+                    'memory_free': memory_total - memory_used,
+                    'utilization_gpu': utilization_gpu,
+                    'power_draw': power_draw,
+                    'power_limit': power_limit,
+                })
+            except ValueError as e:
+                print(f"Warning: Skipping line due to parsing error ({e}): {line}")
+                continue
+
+
+        print(f"GPUs found:\n{gpus}")
+
+        available_gpus = []
+        for gpu in gpus:
+            # Check criteria
+            is_memory_ok = gpu['memory_free'] >= min_free_memory_mib
+            is_util_ok = gpu['utilization_gpu'] < max_utilization_pct
+            # Check power margin (power_draw < (1 - power_margin_pct/100) * power_limit)
+            is_power_ok = gpu['power_draw'] < (1.0 - power_margin_pct / 100.0) * gpu['power_limit']
+
+            if is_memory_ok and is_util_ok and is_power_ok:
+                available_gpus.append(gpu)
+            else:
+                print(f"GPU {gpu['index']} excluded: FreeMem={gpu['memory_free']} MiB (Req>{min_free_memory_mib}), Util={gpu['utilization_gpu']}% (Req<{max_utilization_pct}), PowerDraw={gpu['power_draw']:.1f}W (Limit={gpu['power_limit']:.1f}W, Margin={power_margin_pct}%)")
+
+
+        if available_gpus:
+            # Sort available GPUs by free memory (descending)
+            available_gpus.sort(key=lambda x: x['memory_free'], reverse=True)
+            best_gpu = available_gpus[0]
+            device = torch.device(f"cuda:{best_gpu['index']}")
+            print(f"Selected available CUDA device: cuda:{best_gpu['index']} (Free Memory: {best_gpu['memory_free']} MiB)")
+            return device
+        else:
+            print("No suitable GPUs found based on criteria, using CPU.")
+            return torch.device("cpu")
+
+    except (FileNotFoundError, subprocess.CalledProcessError, Exception) as e:
+        print(f"Could not run nvidia-smi or parse output ({e}), defaulting to first available CUDA device or CPU")
+        # Fallback logic: try generic cuda device if possible, else CPU
+        if torch.cuda.is_available():
+             try:
+                 # Try allocating to default cuda device as a last resort
+                 torch.zeros(1).to('cuda')
+                 print("Warning: Falling back to default CUDA device.")
+                 return torch.device("cuda")
+             except Exception as cuda_err:
+                 print(f"Warning: Default CUDA device also unavailable ({cuda_err}). Falling back to CPU.")
+                 return torch.device("cpu")
+        else:
+             return torch.device("cpu")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="""Soft n Actor-Critic (SnAC)
@@ -327,11 +407,18 @@ See the experiments direcotry of this project to see how I ran experiments using
         help="Evaluate policy every N steps (default: 10000)",
     )
     parser.add_argument(
-        "--hidden-dim",
+        "--critic-arch",
         type=int,
-        default=256,
-        metavar="N",
-        help="Hidden layer dimension (default: 256)",
+        nargs='+',
+        default=[256, 256],
+        help="Architecture of the critic networks (list of hidden layer sizes)"
+    )
+    parser.add_argument(
+        "--actor-arch",
+        type=int,
+        nargs='+',
+        default=[256, 256],
+        help="Architecture of the actor networks (list of hidden layer sizes)"
     )
     parser.add_argument(
         "--alpha-div",
@@ -379,54 +466,28 @@ See the experiments direcotry of this project to see how I ran experiments using
         default="auto",
         help="What device to run the tranining process. Auto will use cuda if available otherwise use cpu, it will search for a cuda device that is not in use."
     )
+    parser.add_argument(
+        "--aggregation-method",
+        type=str,
+        default="max_q",
+        help="What aggregation method to use."
+    )
 
 
     args = parser.parse_args()
 
-    experiment_name = f"snac_{args.env_name}_{args.time_steps}_{args.seed}"
+    experiment_name = f"{args.env_name}_{args.aggregation_method}_{args.seed}"
 
     # --- Configuration ---
-    DEVICE: torch.device
+    computation_device: torch.device
     if args.computation_device == "auto":
-        print("Automatically figuring out which GPU to use.")
-        if torch.cuda.is_available():
-            try:
-                # Try to find the least utilized GPU
-                result = subprocess.run(
-                    ['nvidia-smi', '--query-gpu=index,memory.used', '--format=csv,noheader,nounits'],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
-                )
-                gpus = []
-                for line in result.stdout.strip().split('\n'):
-                    index, memory_used = map(int, line.split(', '))
-                    gpus.append({'index': index, 'memory_used': memory_used})
-
-                print(f"GPUs available are:\n{gpus}")
-
-                if gpus:
-                    gpus.sort(key=lambda x: x['memory_used'])
-                    best_gpu = gpus[0]
-                    # Ignoring GPUs that have more than 10mb of memory used based on the heuristic that that would make them 'occupied'
-                    if best_gpu['memory'] > 10:
-                       print("All GPUs are occupied, using cpu") 
-                       DEVICE = torch.device("cpu")
-                    else:
-                        DEVICE = torch.device(f"cuda:{best_gpu['index']}")
-                        print(f"Auto-selected CUDA device: cuda:{best_gpu['index']}")
-                else:
-                    print("nvidia-smi found no GPUs, defaulting to cuda:0")
-                    DEVICE = torch.device("cuda:0")
-
-            except (FileNotFoundError, subprocess.CalledProcessError, Exception) as e:
-                print(f"Could not run nvidia-smi or parse output ({e}), defaulting to cuda:0")
-                DEVICE = torch.device("cuda:0")
-        else:
-            print("CUDA not available, using CPU.")
-            DEVICE = torch.device("cpu")
+        # Pass thresholds to the selection function if needed, or use defaults
+        computation_device = get_available_computation_device(min_free_memory_mib=1024, max_utilization_pct=10, power_margin_pct=10)
     else:
         try:
-            DEVICE = torch.device(args.computation_device)
-            print(f"Using specified device: {DEVICE}")
+            computation_device = torch.device(args.computation_device)
+            # Optional: Add a check here to see if the *specified* device is actually suitable
+            print(f"Using specified device: {computation_device}")
         except RuntimeError as e:
             print(f"Error setting device to '{args.computation_device}': {e}.")
             exit(1)
@@ -437,19 +498,25 @@ See the experiments direcotry of this project to see how I ran experiments using
     Path(eval_dir).mkdir(parents=True, exist_ok=True)
     Path(save_model_path).mkdir(parents=True, exist_ok=True)
 
+    agent_params = {
+        "num_actors": args.num_actors,
+        "aggregation_method": args.aggregation_method,
+        "gamma": args.gamma,
+        "tau": args.tau,
+        "lr_q": args.lr_q,
+        "lr_pi": args.lr_pi,
+        "lr_alpha": args.lr_alpha,
+        "alpha_div": args.alpha_div,
+        "batch_size": args.batch_size,
+        "memory_size": args.memory_size,
+        "critic_arch": args.critic_arch,
+        "actor_arch": args.actor_arch,
+        "auto_entropy": args.auto_entropy,
+    }
+
     train_snac(
         env_name=args.env_name,
-        num_actors=args.num_actors,
-        gamma=args.gamma,
-        tau=args.tau,
-        lr_q=args.lr_q,
-        lr_pi=args.lr_pi,
-        lr_alpha=args.lr_alpha,
-        alpha_div=args.alpha_div,
-        batch_size=args.batch_size,
-        memory_size=args.memory_size,
-        hidden_dim=args.hidden_dim,
-        auto_entropy=args.auto_entropy,
+        agent_params=agent_params,
         updates_per_step=args.updates_per_step,
         seed=args.seed,
         time_steps=args.time_steps,
@@ -459,4 +526,5 @@ See the experiments direcotry of this project to see how I ran experiments using
         save_model=args.save_model,
         save_model_path=save_model_path,
         experiment_name=experiment_name,
+        computation_device=computation_device
     )
