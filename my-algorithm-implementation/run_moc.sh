@@ -4,6 +4,7 @@
 # This script needs to be passed a task id as an argument as well as the algorithm to run as another arguement
 
 cd ~/code/AIML440_code/my-algorithm-implementation/
+OUTPUTDIR=experiments
 
 task_id=$(($1-1)) # 0-indexed except that grid system doesnt allow 0 as the task id
 num_seeds=10
@@ -19,11 +20,20 @@ envs=("HalfCheetah-v5" "Walker2d-v5" "Humanoid-v5" "Ant-v5" "HumanoidStandup-v5"
 
 selected_env=${envs[$env_index]}
 
+# Get current date/time in yy/m/d_h-m-s format
+current_time=$(date +"%y-%m-%d_%H-%M-%S")
+exp_name="${selected_env}_${seed}_${current_time}"
+
+exp_dir="${PWD}/${OUTPUTDIR}/${exp_name}"
+
+mkdir -p "$exp_dir"
+log_file="$exp_dir/logs.txt"
+
 echo " Running ${selected_env} with seed ${seed}"
 
 training_script=$2/train.py
 
 echo "==Running ${training_script}=="
 
-poetry run python ${training_script} --seed=${seed} --data-dir=$OUTPUTDIR --env=${selected_env} "${@:3}"
-echo "==${training_script} Complete=="
+poetry run python ${training_script} --seed=${seed} --exp-dir="$exp_dir" --env=${selected_env} --exp-name="${exp_name}" "${@:3}" > "$log_file" 2>&1 &
+echo "==${training_script} submitted and running as name ${exp_name}=="

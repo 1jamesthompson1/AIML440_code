@@ -313,7 +313,7 @@ class SnAC:
         self.updates = 0
 
         print("==SnAC agent made==")
-        print(f"Parameters: num_actors={num_actors}, gamma={gamma}, tau={tau}, lr_q={lr_q}, lr_pi={lr_pi}, lr_alpha={lr_alpha}, alpha_div={alpha_div}, batch_size={batch_size}, memory_size={memory_size}, actor_arch={actor_arch}, critic_arch={critic_arch}, auto_entropy={auto_entropy}, aggregation_method={aggregation_method}")
+        print(f"Parameters: num_actors={num_actors}, gamma={gamma}, tau={tau}, lr_q={lr_q}, lr_pi={lr_pi}, lr_alpha={lr_alpha}, alpha_div={alpha_div}, target_update_interval={target_update_interval}, update_every={update_every}, memory_size={memory_size}, batch_size={batch_size}, actor_arch={actor_arch}, critic_arch={critic_arch}, auto_entropy={auto_entropy}, target_entropy={target_entropy}, aggregation_method={aggregation_method}")
 
     def select_action(
         self, state: np.ndarray, evaluate: bool = False
@@ -425,11 +425,12 @@ class SnAC:
                 stacked_next_log_probs = torch.stack(all_next_log_probs)
 
                 # Handle cases where policy_index is -1 (random actions during start_steps)
-                # Currently handles them by assigning them a zero.
-                # Another option could be to instead randomly generate a policy index.
+                # Currently handles it by assigning random action index for the actions
                 random_action_mask = (policy_indices == -1)
                 policy_indices_for_gather = policy_indices.clone()
-                policy_indices_for_gather[random_action_mask] = 0
+                policy_indices_for_gather[random_action_mask] = torch.randint(
+                    0, self.num_actors, (random_action_mask.sum(),), device=self.computation_device
+                )
 
                 idx_expanded_log_prob = policy_indices_for_gather.view(1, self.batch_size, 1).expand(-1, -1, stacked_next_log_probs.shape[-1])
                 idx_expanded_action = policy_indices_for_gather.view(1, self.batch_size, 1).expand(-1, -1, stacked_next_actions.shape[-1])

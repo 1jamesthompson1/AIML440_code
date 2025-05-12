@@ -7,6 +7,7 @@ import time
 import random
 import gymnasium as gym
 import os.path as osp
+import os
 import subprocess
 
 
@@ -14,6 +15,8 @@ from snac import SnAC
 
 
 def train_snac(
+    experiment_name: str,
+    exp_dir: str,
     env_name: str,
     agent_params: dict,
     updates_per_step: int,
@@ -21,11 +24,9 @@ def train_snac(
     time_steps: int,
     start_steps: int,
     eval_every: int,
-    eval_dir: str,
     save_model: bool,
-    save_model_path: str,
-    experiment_name: str,
-    computation_device: torch.device
+    record_video: bool,
+    computation_device: torch.device,
 ):
     """
     Trains the Soft n Actor-Critic (SnAC) algorithm on a specified environment.
@@ -50,29 +51,34 @@ def train_snac(
         computation_device=computation_device,
     )
 
+    if record_video:
+        video_dir = osp.join(exp_dir, "eval_videos")
+        os.makedirs(video_dir, exist_ok=True)
+
     state_tuple: Tuple[np.ndarray, dict] = env.reset(seed=seed)
     state: np.ndarray = state_tuple[0]
     episode_reward: float = 0.0
     episode_timesteps: int = 0
     episode_num: int = 0
     episode_start_time: float = time.time()
+    training_start_time: float = episode_start_time
 
     # Setting up evaluation variables
     eval_rewards: List[List[float]] = []
     eval_ep_lengths: List[List[int]] = []
     eval_time_steps: List[int] = []
-    eval_path = Path(eval_dir)
-    eval_path.mkdir(parents=True, exist_ok=True)
 
     
     print ("Training parameters:")
     print(f"Environment: {env_name}")
     print(f"Device: {computation_device}")
+    print(f"Process ID: {os.getpid()}")
     print(f"Environment name: {env_name}")
-    print(f"Start time of training: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(episode_start_time))}")
-    print(f"Using settings: updates_per_step={updates_per_step}, seed={seed}, time_steps={time_steps}, start_steps={start_steps}, eval_every={eval_every}, eval_dir={eval_dir},  save_model={save_model}, save_model_path={save_model_path}, experiment_name={experiment_name}")
+    print(f"Start time of training: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(training_start_time))}")
+    print(f"Using settings: updates_per_step={updates_per_step}, seed={seed}, time_steps={time_steps}, start_steps={start_steps}, eval_every={eval_every}, exp_dir={exp_dir}, save_model={save_model}, experiment_name={experiment_name}", flush=True)
 
 
+    episode_action_counts: np.ndarray = np.zeros(agent.num_actors+1, dtype=int)
     for frame_idx in range(1, time_steps + 1):
         episode_timesteps += 1
 
@@ -83,6 +89,8 @@ def train_snac(
             policy_index = -1  # Indicate random action
         else:
             action, policy_index = agent.select_action(state)
+
+        episode_action_counts[policy_index] += 1
 
         next_state: np.ndarray
         reward: Any
@@ -106,7 +114,8 @@ def train_snac(
             episode_end_time = time.time()
             episode_duration = episode_end_time - episode_start_time
             print(
-                f"Total T: {frame_idx} Episode Num: {episode_num + 1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f} Alpha: {agent.alpha:.4f} Duration: {episode_duration:.2f}s"
+                f"Total T: {frame_idx} Episode Num: {episode_num + 1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f} Alpha: {agent.alpha:.4f} Actor action counts: {episode_action_counts.tolist()} Duration: {episode_duration:.2f}s",
+                 flush=True
             )
             state_tuple = env.reset(seed=seed + episode_num + 1)
             state = state_tuple[0]
@@ -114,8 +123,9 @@ def train_snac(
             episode_timesteps = 0
             episode_num += 1
             episode_start_time = time.time()
+            episode_action_counts = np.zeros(agent.num_actors+1, dtype=int)
 
-        if frame_idx % eval_every == 0 and frame_idx > start_steps:
+        if frame_idx % eval_every == 0 and frame_idx >= start_steps:
             print(f"\n--- Evaluation at step {frame_idx} ---")
             evaluation_start_time = time.time()
 
@@ -125,35 +135,41 @@ def train_snac(
                 num_episodes=10,
                 max_steps=1000,
                 seed=seed + frame_idx,
+                video_dir=video_dir if record_video else None,
             )
 
             if curr_eval_rewards:
                 avg_reward: float = float(np.mean(curr_eval_rewards))
                 print(
-                    f"Average Evaluation Reward ({len(curr_eval_rewards)} episodes): {avg_reward:.3f}, evaluation duration: {time.time() - evaluation_start_time:.2f}s"
+                    f"Average Evaluation Reward ({len(curr_eval_rewards)} episodes): {avg_reward:.3f}, evaluation duration: {time.time() - evaluation_start_time:.2f}s", flush=True
                 )
             else:
-                print("Evaluation failed or produced no results.")
+                print("Evaluation failed or produced no results.", flush=True)
 
             eval_rewards.append(curr_eval_rewards)
             eval_time_steps.append(frame_idx)
             eval_ep_lengths.append(curr_eval_ep_lengths)
             np.savez(
-                eval_path / experiment_name,
+                osp.join(exp_dir, "evaluations"),
                 timesteps=eval_time_steps,
                 results=eval_rewards,
                 ep_lengths=eval_ep_lengths,
             )
 
             if save_model: # Use save_model parameter
-                agent.save_model(osp.join(save_model_path, f"{experiment_name}.pt"))
+                agent.save_model(osp.join(exp_dir, "agent.pt"))
 
     env.close()
-    print("Training finished.")
-    agent.save_model(osp.join(save_model_path, f"{experiment_name}_final.pt"))
+    end_training_time = time.time()
+    total_training_duration = end_training_time - training_start_time
+
+    print(
+        f"Training completed in {total_training_duration:.2f}s. Which is {total_training_duration/3600} hours.",
+    )
+    agent.save_model(osp.join(exp_dir, "agent_final.pt"))
 
 
-def evaluate_model(env_name: str, agent: SnAC, seed: int, num_episodes: int=10, max_steps: int=1000):
+def evaluate_model(env_name: str, agent: SnAC, seed: int, num_episodes: int=10, max_steps: int=1000, video_dir = None):
     """
     Evaluates the model on a envrionment
 
@@ -169,7 +185,17 @@ def evaluate_model(env_name: str, agent: SnAC, seed: int, num_episodes: int=10, 
 
     eval_env: Optional[gym.Env] = None
     try:
-        eval_env = gym.make(env_name)
+        if video_dir is not None:
+            eval_env = gym.make(env_name, render_mode="rgb_array")
+            eval_env = gym.wrappers.RecordVideo(
+                eval_env,
+                video_folder=video_dir,
+                episode_trigger=lambda ep_id: ep_id == 0,  # Only record the first episode
+                name_prefix=f"eval-{seed}"
+            )
+        else:
+            eval_env = gym.make(env_name)
+        
         for eval_ep_idx in range(num_episodes):
             eval_state_tuple = eval_env.reset(
                 seed=seed + eval_ep_idx
@@ -313,12 +339,16 @@ See the experiments direcotry of this project to see how I ran experiments using
 
     )
     parser.add_argument(
+        "--exp-name",
+        help="This is the name of the experiment. Each of the outfiles will be called this."
+    )
+    parser.add_argument(
         "--env-name",
         default="InvertedPendulum-v5",
         help="Gym environment name (default: InvertedPendulum-v5)",
     )
     parser.add_argument(
-        "--data-dir",
+        "--exp-dir",
         type=str,
         help="Base directory for the experiment data."
     )
@@ -402,7 +432,7 @@ See the experiments direcotry of this project to see how I ran experiments using
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=1_000, # Corrected default value based on help text
+        default=10_000,
         metavar="N",
         help="Evaluate policy every N steps (default: 10000)",
     )
@@ -443,22 +473,10 @@ See the experiments direcotry of this project to see how I ran experiments using
         "--seed", type=int, default=123, metavar="N", help="Random seed (default: 123)"
     )
     parser.add_argument(
-        "--eval-dir",
-        type=str,
-        default="training_evaluations",
-        help="Directory for evaluation logs to go to (default: training_evaluations)",
-    )
-    parser.add_argument(
         "--save-model",
         action="store_true",
         default=True,
         help="Whether the model should be saved (default: True). Note depending on the environment this may be large as the replay buffer is saved as well.",
-    )
-    parser.add_argument(
-        "--save-model-path",
-        type=str,
-        default="snac_model",
-        help="Path prefix to save models (default: snac_model)",
     )
     parser.add_argument(
         "--computation-device",
@@ -472,11 +490,16 @@ See the experiments direcotry of this project to see how I ran experiments using
         default="max_q",
         help="What aggregation method to use."
     )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        default=False,
+        help="Directory to save evaluation videos. If None, no videos will be saved."
+    )
 
 
     args = parser.parse_args()
 
-    experiment_name = f"{args.env_name}_{args.aggregation_method}_{args.seed}"
 
     # --- Configuration ---
     computation_device: torch.device
@@ -486,17 +509,12 @@ See the experiments direcotry of this project to see how I ran experiments using
     else:
         try:
             computation_device = torch.device(args.computation_device)
-            # Optional: Add a check here to see if the *specified* device is actually suitable
             print(f"Using specified device: {computation_device}")
         except RuntimeError as e:
             print(f"Error setting device to '{args.computation_device}': {e}.")
             exit(1)
 
-
-    eval_dir = osp.join(args.data_dir, args.eval_dir)
-    save_model_path = osp.join(args.data_dir, args.save_model_path)
-    Path(eval_dir).mkdir(parents=True, exist_ok=True)
-    Path(save_model_path).mkdir(parents=True, exist_ok=True)
+    # --- Experiment output directory structure ---
 
     agent_params = {
         "num_actors": args.num_actors,
@@ -516,15 +534,15 @@ See the experiments direcotry of this project to see how I ran experiments using
 
     train_snac(
         env_name=args.env_name,
+        experiment_name=args.exp_name,
         agent_params=agent_params,
         updates_per_step=args.updates_per_step,
         seed=args.seed,
         time_steps=args.time_steps,
         start_steps=args.start_steps,
         eval_every=args.eval_every,
-        eval_dir=eval_dir,
+        computation_device=computation_device,
         save_model=args.save_model,
-        save_model_path=save_model_path,
-        experiment_name=experiment_name,
-        computation_device=computation_device
+        exp_dir = args.exp_dir,
+        record_video=args.record_video
     )
