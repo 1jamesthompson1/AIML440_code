@@ -140,8 +140,10 @@ def train_snac(
 
             if curr_eval_rewards:
                 avg_reward: float = float(np.mean(curr_eval_rewards))
+                min_reward: float = float(np.min(curr_eval_rewards))
+                max_reward: float = float(np.max(curr_eval_rewards))
                 print(
-                    f"Average Evaluation Reward ({len(curr_eval_rewards)} episodes): {avg_reward:.3f}, evaluation duration: {time.time() - evaluation_start_time:.2f}s", flush=True
+                    f"Average Evaluation Reward ({len(curr_eval_rewards)} episodes): {avg_reward:.3f}, min: {min_reward:.3f}, max: {max_reward:.3f}, evaluation duration: {time.time() - evaluation_start_time:.2f}s", flush=True
                 )
             else:
                 print("Evaluation failed or produced no results.", flush=True)
@@ -437,6 +439,24 @@ See the experiments direcotry of this project to see how I ran experiments using
         help="Evaluate policy every N steps (default: 10000)",
     )
     parser.add_argument(
+        "--sticky-actor-actions",
+        type=int,
+        default=0,
+        help="This decides how many action the select actor will get to take. This gives an actor some ability to 'carry out' its plan."
+    )
+    parser.add_argument(
+        "--policy-update-temperature",
+        type=float,
+        default=0.1,
+        help="This is the temperature for the policy update. It is used to determine how muc the policy disagrement affects the weight of the policy update."
+    )
+    parser.add_argument(
+        '--actor-aware-critic',
+        action='store_true',
+        default=False,
+        help='Use actor-aware critic (default: False). This means that the critic will be given the state, action taken AND the actor which took it (via one hot encoding)'
+    )
+    parser.add_argument(
         "--critic-arch",
         type=int,
         nargs='+',
@@ -530,6 +550,9 @@ See the experiments direcotry of this project to see how I ran experiments using
         "critic_arch": args.critic_arch,
         "actor_arch": args.actor_arch,
         "auto_entropy": args.auto_entropy,
+        "sticky_actor_actions": args.sticky_actor_actions,
+        "policy_update_temperature": args.policy_update_temperature,
+        "actor_aware_critic": args.actor_aware_critic,
     }
 
     train_snac(

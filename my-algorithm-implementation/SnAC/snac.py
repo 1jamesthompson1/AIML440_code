@@ -8,7 +8,7 @@ import numpy as np
 import random
 from collections import deque
 import gymnasium as gym
-from typing import List, Tuple, Dict, Deque, NamedTuple, Optional, Any
+from typing import List, Tuple, Dict, Deque, NamedTuple, Optional, Any, Union
 
 
 # --- Replay Buffer ---
@@ -83,14 +83,26 @@ class Network(nn.Module):
 class CriticNetwork(Network):
     output: nn.Linear
 
-    def __init__(self, computation_device: torch.device, num_inputs: int, num_actions: int, arch: List[int]):
+    def __init__(self, computation_device: torch.device, num_inputs: int, num_actions: int, arch: List[int], num_actors: Optional[int] = None):
         super(CriticNetwork, self).__init__(computation_device)
-        self.init_hidden_layers(num_inputs + num_actions, arch)
+
+        if num_actors is not None:
+            self.init_hidden_layers(num_inputs + num_actions + num_actors, arch)
+            self.actor_aware_critic = True
+        else:
+            self.init_hidden_layers(num_inputs + num_actions, arch)
+            self.actor_aware_critic = False
 
         self.output = nn.Linear(self.hidden_layers[-1].out_features, 1, device=self.computation_device)
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        x = self.hidden_layer_fp(torch.cat([state, action], 1))
+    def forward(self, state: torch.Tensor, action: torch.Tensor, actor_encoding: Optional[torch.Tensor]=None) -> torch.Tensor:
+        if self.actor_aware_critic:
+            if actor_encoding is not None:
+                x = self.hidden_layer_fp(torch.cat([state, action, actor_encoding], 1))
+            else:
+                raise ValueError("actor_encoding must be provided for actor-aware critic")
+        else:
+            x = self.hidden_layer_fp(torch.cat([state, action], 1))
         x = self.output(x)
         return x
 
@@ -165,7 +177,7 @@ class PolicyNetwork(Network):
         action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
 
-        log_prob -= torch.log(self.action_scale * (2 - y_t.pow(2)) + 1e-6)
+        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
         mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean_action
@@ -198,6 +210,9 @@ class SnAC:
     actors: List[PolicyNetwork]
     policy_optimizers: List[optim.Optimizer]
     auto_entropy: bool
+    sticky_actor_actions: int
+    policy_update_temperature: float
+    actor_aware_critic: bool
     target_entropy: float
     log_alpha: torch.Tensor
     alpha_optimizer: Optional[optim.Optimizer]  # Can be None if auto_entropy is False
@@ -224,6 +239,9 @@ class SnAC:
         critic_arch: List[int] = [256, 256],
         actor_arch: List[int] = [256,256],
         auto_entropy: bool = True,
+        sticky_actor_actions: int = 0,
+        policy_update_temperature: float = 0.,
+        actor_aware_critic: bool = False,
         target_entropy: Optional[float] = None,
         computation_device: torch.device = torch.device("cpu"),
     ):
@@ -235,6 +253,8 @@ class SnAC:
         self.update_every = update_every
         self.batch_size = batch_size
         self.num_actors = num_actors
+        self.policy_update_temperature = policy_update_temperature
+        self.actor_aware_critic = actor_aware_critic
 
         self.supported_aggregation_methods = [
             "elementwise",
@@ -258,20 +278,20 @@ class SnAC:
         self.action_dim = self.action_space.shape[0]
 
         # Critics
-        self.critic1 = CriticNetwork(self.computation_device, self.state_dim, self.action_dim, critic_arch).to(
-            self.computation_device
-        )
-        self.critic2 = CriticNetwork(self.computation_device, self.state_dim, self.action_dim, critic_arch).to(
-            self.computation_device
-        )
-        self.critic1_target = CriticNetwork(
-            self.computation_device,
-            self.state_dim, self.action_dim, critic_arch
-        ).to(self.computation_device)
-        self.critic2_target = CriticNetwork(
-            self.computation_device,
-            self.state_dim, self.action_dim, critic_arch
-        ).to(self.computation_device)
+        def create_critic():
+            return CriticNetwork(
+                self.computation_device,
+                self.state_dim,
+                self.action_dim,
+                critic_arch,
+                num_actors=num_actors if actor_aware_critic else None
+            ).to(self.computation_device)
+
+        self.critic1 = create_critic()
+        self.critic2 = create_critic()
+        self.critic1_target = create_critic()
+        self.critic2_target = create_critic()
+
         self.critic1_target.load_state_dict(self.critic1.state_dict())
         self.critic2_target.load_state_dict(self.critic2.state_dict())
         self.q_optimizer = optim.Adam(
@@ -311,31 +331,68 @@ class SnAC:
 
         self.memory = ReplayBuffer(memory_size)
         self.updates = 0
+        self.sticky_actor_actions = sticky_actor_actions
+        self.sticky_actor_actions_left = sticky_actor_actions
+        self.sticky_actor = -1
 
         print("==SnAC agent made==")
-        print(f"Parameters: num_actors={num_actors}, gamma={gamma}, tau={tau}, lr_q={lr_q}, lr_pi={lr_pi}, lr_alpha={lr_alpha}, alpha_div={alpha_div}, target_update_interval={target_update_interval}, update_every={update_every}, memory_size={memory_size}, batch_size={batch_size}, actor_arch={actor_arch}, critic_arch={critic_arch}, auto_entropy={auto_entropy}, target_entropy={target_entropy}, aggregation_method={aggregation_method}")
+        print(f"Parameters: num_actors={num_actors}, gamma={gamma}, tau={tau}, lr_q={lr_q}, lr_pi={lr_pi}, lr_alpha={lr_alpha}, alpha_div={alpha_div}, target_update_interval={target_update_interval}, update_every={update_every}, memory_size={memory_size}, batch_size={batch_size}, actor_arch={actor_arch}, critic_arch={critic_arch}, auto_entropy={auto_entropy}, target_entropy={target_entropy}, aggregation_method={aggregation_method}, sticky_actor_actions={sticky_actor_actions}, policy_update_temperature={policy_update_temperature}, actor_aware_critic={actor_aware_critic}")
+
+    def __get_critics_opinion(self, critic1: CriticNetwork, critic2: CriticNetwork, state: torch.Tensor, action: torch.Tensor, actor_idx: Union[int, torch.Tensor]) -> torch.Tensor:
+        """
+        Runs a forward pass through both critics and returns the minimum Q value
+        """
+        if self.actor_aware_critic:
+            actor_encoding = F.one_hot(
+                torch.tensor([actor_idx], dtype=torch.long, device=self.computation_device) if isinstance(actor_idx, int) else actor_idx,
+                num_classes=self.num_actors
+            ).float().to(self.computation_device)
+
+            q1 = critic1(state, action, actor_encoding)
+            q2 = critic2(state, action, actor_encoding)
+        else:
+            q1 = critic1(state, action)
+            q2 = critic2(state, action)
+
+        min_q = torch.min(q1, q2)
+
+        return min_q
 
     def select_action(
         self, state: np.ndarray, evaluate: bool = False
     ) -> Tuple[np.ndarray, int]:
         state_tensor = torch.FloatTensor(state).to(self.computation_device).unsqueeze(0)
 
-        with torch.no_grad():
-            all_actions: List[torch.Tensor] = []
-            min_q_values: List[torch.Tensor] = []
-            for actor in self.actors:
-                action, _, _ = actor.sample(state_tensor)
-                q1 = self.critic1(state_tensor, action)
-                q2 = self.critic2(state_tensor, action)
-                min_q = torch.min(q1, q2)
-                all_actions.append(action)
-                min_q_values.append(min_q)
-        
-        selected_action, policy_index = self.aggregate_actions(
-            all_actions, min_q_values
-        ) 
+        if self.sticky_actor_actions_left > 0 and self.sticky_actor != -1:
+            selected_action, _, _ = self.actors[self.sticky_actor].sample(state_tensor)
+            self.sticky_actor_actions_left -= 1
+        else:
+            with torch.no_grad():
+                all_actions: List[torch.Tensor] = []
+                min_q_values: List[torch.Tensor] = []
+                for actor_idx, actor in enumerate(self.actors):
+                    action, _, _ = actor.sample(state_tensor)
 
-        return selected_action.detach().cpu().numpy()[0], policy_index
+                    min_q = self.__get_critics_opinion(
+                        self.critic1,
+                        self.critic2,
+                        state_tensor,
+                        action,
+                        actor_idx
+                    )
+
+                    all_actions.append(action)
+                    min_q_values.append(min_q)
+            
+            selected_action, actor_index = self.aggregate_actions(
+                all_actions, min_q_values
+            ) 
+            self.sticky_actor = actor_index
+            self.sticky_actor_actions_left = self.sticky_actor_actions
+
+
+        return selected_action.detach().cpu().numpy()[0], self.sticky_actor
+
 
     def aggregate_actions(
             self, actions: List[torch.Tensor], action_values: List[torch.Tensor]
@@ -442,22 +499,25 @@ class SnAC:
                 # This effectively removes the entropy bonus for these steps in the target Q calculation
                 next_state_log_pi[random_action_mask.unsqueeze(1)] = 0.0
 
-                qf1_next_target = self.critic1_target(
-                    next_state_batch, next_state_action
-                )
-                qf2_next_target = self.critic2_target(
-                    next_state_batch, next_state_action
+                min_qf_target = self.__get_critics_opinion(
+                    self.critic1_target,
+                    self.critic2_target,
+                    next_state_batch,
+                    next_state_action,
+                    policy_indices_for_gather
                 )
                 min_qf_next_target = (
-                    torch.min(qf1_next_target, qf2_next_target)
-                    - self.alpha * next_state_log_pi
+                    min_qf_target - self.alpha * next_state_log_pi
                 )
                 next_q_value = (
                     reward_batch + (1 - done_batch) * self.gamma * min_qf_next_target
                 )
-
-            qf1 = self.critic1(state_batch, action_batch)
-            qf2 = self.critic2(state_batch, action_batch)
+            actor_1_hot = F.one_hot(
+                policy_indices_for_gather,
+                num_classes=self.num_actors
+            ).float().to(self.computation_device)
+            qf1 = self.critic1(state_batch, action_batch, actor_1_hot)
+            qf2 = self.critic2(state_batch, action_batch, actor_1_hot)
             qf1_loss = F.mse_loss(qf1, next_q_value)
             qf2_loss = F.mse_loss(qf2, next_q_value)
             qf_loss = qf1_loss + qf2_loss
@@ -473,14 +533,29 @@ class SnAC:
                 p.requires_grad = False
 
             alpha_loss_total = torch.tensor(0.0, device=self.computation_device)
+
+            # Calculate the agreement value. Copying idea from SUNRISE weighted bellman backup
+            actor_samples = [actor.sample(state_batch) for actor in self.actors]
+            
+            actions = torch.stack([sample[2] for sample in actor_samples])
+            mean = actions.mean(dim=0, keepdim=True)
+            std = actions.std(dim=0, keepdim=True)
+            standardized_actions = (actions - mean) / (std + 1e-6)
+            disagreement = standardized_actions.std(dim=0, keepdim=True).mean()
+            policy_update_weight = torch.sigmoid(-disagreement*self.policy_update_temperature) + 0.5
+
             for i, (actor, optimizer) in enumerate(
                 zip(self.actors, self.policy_optimizers)
             ):
-                pi_actions, pi_log_pi, _ = actor.sample(state_batch)
+                pi_actions, pi_log_pi, _ = actor_samples[i]
 
-                qf1_pi = self.critic1(state_batch, pi_actions)
-                qf2_pi = self.critic2(state_batch, pi_actions)
-                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                min_qf_pi = self.__get_critics_opinion(
+                    self.critic1,
+                    self.critic2,
+                    state_batch,
+                    pi_actions,
+                    policy_indices_for_gather
+                )
                 policy_loss_q_term = (self.alpha * pi_log_pi - min_qf_pi).mean()
 
                 kl_div_term = torch.tensor(0.0, device=self.computation_device)
@@ -496,7 +571,7 @@ class SnAC:
                         kl_sum += kl.mean()
                     kl_div_term = kl_sum
 
-                policy_loss = policy_loss_q_term + self.alpha_div * kl_div_term
+                policy_loss = policy_update_weight.detach() * (policy_loss_q_term + self.alpha_div * kl_div_term)
 
                 optimizer.zero_grad()
                 policy_loss.backward()
