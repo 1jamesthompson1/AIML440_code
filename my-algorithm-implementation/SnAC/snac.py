@@ -240,6 +240,7 @@ class SnAC:
         actor_arch: List[int] = [256,256],
         auto_entropy: bool = True,
         sticky_actor_actions: int = 0,
+        single_actor_episodes: bool = False,
         policy_update_temperature: float = 0.,
         actor_aware_critic: bool = False,
         target_entropy: Optional[float] = None,
@@ -317,7 +318,7 @@ class SnAC:
         self.auto_entropy = auto_entropy
         if self.auto_entropy:
             if target_entropy is None:
-                self.target_entropy = -float(np.prod(self.action_space.shape).item())
+                self.target_entropy = -float(self.action_dim)
             else:
                 self.target_entropy = target_entropy
             self.log_alpha = torch.zeros(1, requires_grad=True, device=self.computation_device)
@@ -331,12 +332,27 @@ class SnAC:
 
         self.memory = ReplayBuffer(memory_size)
         self.updates = 0
+
+        # Sticky actor setup
         self.sticky_actor_actions = sticky_actor_actions
         self.sticky_actor_actions_left = sticky_actor_actions
         self.sticky_actor = -1
 
+        # Single actor setup
+        self.single_actor_episodes = single_actor_episodes
+        self.episodes_actor = np.random.randint(0, num_actors - 1) if self.single_actor_episodes else -1
+
         print("==SnAC agent made==")
-        print(f"Parameters: num_actors={num_actors}, gamma={gamma}, tau={tau}, lr_q={lr_q}, lr_pi={lr_pi}, lr_alpha={lr_alpha}, alpha_div={alpha_div}, target_update_interval={target_update_interval}, update_every={update_every}, memory_size={memory_size}, batch_size={batch_size}, actor_arch={actor_arch}, critic_arch={critic_arch}, auto_entropy={auto_entropy}, target_entropy={target_entropy}, aggregation_method={aggregation_method}, sticky_actor_actions={sticky_actor_actions}, policy_update_temperature={policy_update_temperature}, actor_aware_critic={actor_aware_critic}")
+        print(f"Parameters: num_actors={num_actors}, gamma={gamma}, tau={tau}, lr_q={lr_q}, lr_pi={lr_pi}, lr_alpha={lr_alpha}, alpha_div={alpha_div}, target_update_interval={target_update_interval}, update_every={update_every}, memory_size={memory_size}, batch_size={batch_size}, actor_arch={actor_arch}, critic_arch={critic_arch}, auto_entropy={auto_entropy}, target_entropy={target_entropy}, aggregation_method={aggregation_method}, sticky_actor_actions={sticky_actor_actions}, single_actor_episodes={single_actor_episodes}, policy_update_temperature={policy_update_temperature}, actor_aware_critic={actor_aware_critic}")
+
+    def episode_reset(self):
+        """
+        This is a place that anything that needs to be done to get the agent ready for the next episode.
+        """
+        if self.single_actor_episodes:
+            self.episodes_actor = np.random.randint(0, self.num_actors -1)
+        
+        self.sticky_actor_actions_left = self.sticky_actor_actions
 
     def __get_critics_opinion(self, critic1: CriticNetwork, critic2: CriticNetwork, state: torch.Tensor, action: torch.Tensor, actor_idx: Union[int, torch.Tensor]) -> torch.Tensor:
         """
@@ -361,17 +377,27 @@ class SnAC:
     def select_action(
         self, state: np.ndarray, evaluate: bool = False
     ) -> Tuple[np.ndarray, int]:
+        def get_actor_action(actor):
+            if evaluate:
+                return actor.sample(state_tensor)[2]
+            else:
+                return actor.sample(state_tensor)[0]
+    
         state_tensor = torch.FloatTensor(state).to(self.computation_device).unsqueeze(0)
 
-        if self.sticky_actor_actions_left > 0 and self.sticky_actor != -1:
-            selected_action, _, _ = self.actors[self.sticky_actor].sample(state_tensor)
+        if self.single_actor_episodes:
+            selected_action = get_actor_action(self.actors[self.episodes_actor])
+            self.sticky_actor = self.episodes_actor
+        elif self.sticky_actor_actions_left > 0 and self.sticky_actor != -1 and not evaluate:
+            selected_action = get_actor_action(self.actors[self.sticky_actor])
             self.sticky_actor_actions_left -= 1
         else:
             with torch.no_grad():
                 all_actions: List[torch.Tensor] = []
                 min_q_values: List[torch.Tensor] = []
                 for actor_idx, actor in enumerate(self.actors):
-                    action, _, _ = actor.sample(state_tensor)
+                    # evaluate = True # TODO: Testing to see if one should always use the mean action. I.e make each actor deterministic
+                    action = get_actor_action(actor)
 
                     min_q = self.__get_critics_opinion(
                         self.critic1,
@@ -423,7 +449,6 @@ class SnAC:
                 selected_action = torch.sum(
                     torch.stack(actions) * weights, dim=0
                 )
-
 
             normalized_actions = [F.normalize(action, p=2, dim=-1) for action in actions]
             normalized_selection = F.normalize(selected_action, p=2, dim=-1)
@@ -536,13 +561,15 @@ class SnAC:
 
             # Calculate the agreement value. Copying idea from SUNRISE weighted bellman backup
             actor_samples = [actor.sample(state_batch) for actor in self.actors]
-            
-            actions = torch.stack([sample[2] for sample in actor_samples])
-            mean = actions.mean(dim=0, keepdim=True)
-            std = actions.std(dim=0, keepdim=True)
-            standardized_actions = (actions - mean) / (std + 1e-6)
-            disagreement = standardized_actions.std(dim=0, keepdim=True).mean()
-            policy_update_weight = torch.sigmoid(-disagreement*self.policy_update_temperature) + 0.5
+            if len(actor_samples) == 1:
+                policy_update_weight = torch.tensor(1.0, device=self.computation_device)
+            else:
+                actions = torch.stack([sample[2] for sample in actor_samples])
+                mean = actions.mean(dim=0, keepdim=True)
+                std = actions.std(dim=0, keepdim=True)
+                standardized_actions = (actions - mean) / (std + 1e-6)
+                disagreement = standardized_actions.std(dim=0, keepdim=True).mean()
+                policy_update_weight = torch.sigmoid(-disagreement*self.policy_update_temperature) + 0.5
 
             for i, (actor, optimizer) in enumerate(
                 zip(self.actors, self.policy_optimizers)

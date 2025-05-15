@@ -73,6 +73,7 @@ def train_snac(
     print(f"Environment: {env_name}")
     print(f"Device: {computation_device}")
     print(f"Process ID: {os.getpid()}")
+    print(f"Running on machine {os.uname().nodename}")
     print(f"Environment name: {env_name}")
     print(f"Start time of training: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(training_start_time))}")
     print(f"Using settings: updates_per_step={updates_per_step}, seed={seed}, time_steps={time_steps}, start_steps={start_steps}, eval_every={eval_every}, exp_dir={exp_dir}, save_model={save_model}, experiment_name={experiment_name}", flush=True)
@@ -84,11 +85,7 @@ def train_snac(
 
         action: np.ndarray
         policy_index: int
-        if frame_idx < start_steps:
-            action = env.action_space.sample()
-            policy_index = -1  # Indicate random action
-        else:
-            action, policy_index = agent.select_action(state)
+        action, policy_index = agent.select_action(state)
 
         episode_action_counts[policy_index] += 1
 
@@ -124,6 +121,7 @@ def train_snac(
             episode_num += 1
             episode_start_time = time.time()
             episode_action_counts = np.zeros(agent.num_actors+1, dtype=int)
+            agent.episode_reset()
 
         if frame_idx % eval_every == 0 and frame_idx >= start_steps:
             print(f"\n--- Evaluation at step {frame_idx} ---")
@@ -445,9 +443,15 @@ See the experiments direcotry of this project to see how I ran experiments using
         help="This decides how many action the select actor will get to take. This gives an actor some ability to 'carry out' its plan."
     )
     parser.add_argument(
+        "--single-actor-episodes",
+        action='store_true',
+        default=False,
+        help="This changes the algorithm to instead just randomly use a single actor for the duration of a episode. It takes prescedent over all other rules like sticky actor, aggregation method etc."
+    )
+    parser.add_argument(
         "--policy-update-temperature",
         type=float,
-        default=0.1,
+        default=0.0,
         help="This is the temperature for the policy update. It is used to determine how muc the policy disagrement affects the weight of the policy update."
     )
     parser.add_argument(
@@ -551,6 +555,7 @@ See the experiments direcotry of this project to see how I ran experiments using
         "actor_arch": args.actor_arch,
         "auto_entropy": args.auto_entropy,
         "sticky_actor_actions": args.sticky_actor_actions,
+        "single_actor_episodes": args.single_actor_episodes,
         "policy_update_temperature": args.policy_update_temperature,
         "actor_aware_critic": args.actor_aware_critic,
     }

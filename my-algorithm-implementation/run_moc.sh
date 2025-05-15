@@ -24,7 +24,7 @@ selected_env=${envs[$env_index]}
 current_time=$(date +"%y-%m-%d_%H-%M-%S")
 exp_name="${selected_env}_${seed}_${current_time}"
 
-exp_dir="${PWD}/${OUTPUTDIR}/${exp_name}"
+exp_dir="${PWD}/${OUTPUTDIR}/${2}/${exp_name}"
 
 mkdir -p "$exp_dir"
 log_file="$exp_dir/logs.txt"
