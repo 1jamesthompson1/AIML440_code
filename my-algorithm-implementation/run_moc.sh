@@ -36,4 +36,4 @@ training_script=$2/train.py
 echo "==Running ${training_script}=="
 
 poetry run python ${training_script} --seed=${seed} --exp-dir="$exp_dir" --env=${selected_env} --exp-name="${exp_name}" "${@:3}" > "$log_file" 2>&1 &
-echo "==${training_script} submitted and running as name ${exp_name}=="
+echo "==${training_script} submitted and running as name ${exp_name} with PID ${!}=="

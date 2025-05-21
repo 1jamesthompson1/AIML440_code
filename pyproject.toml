@@ -23,6 +23,7 @@ notebook = "^7.3.3"
 cython = "^3.0.12"
 sbx-rl = "^0.20.0"
 jax = {extras = ["cuda12"], version = "^0.5.3"}
+rich = "^14.0.0"
 
 
 [tool.poetry.group.dev.dependencies]
