@@ -5,12 +5,37 @@ from typing import List, Tuple, Optional, Any
 from pathlib import Path
 import time
 import random
+from gymnasium import ActionWrapper
 import gymnasium as gym
 import os.path as osp
 import os
 import torch.nn.functional as F
 
-from dsunrise import DSUNRISE 
+from rich.table import Table
+from rich.console import Console
+
+from dsunrise import DSUNRISE
+
+class NormalizedBoxEnv(ActionWrapper):
+    """
+    Normalize actions to be in the range [-1, 1].
+    """
+
+    def __init__(self, env: gym.Env, reward_scale: float = 1.0):
+        super().__init__(env)
+        self._reward_scale = reward_scale
+        # Set the action space to [-1, 1] for all dimensions
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=env.action_space.shape, dtype=np.float32)
+
+    def action(self, action: np.ndarray) -> np.ndarray:
+        """
+        Scale the normalized action back to the original action space of the environment.
+        """
+        low = self.env.action_space.low
+        high = self.env.action_space.high
+        scaled_action = low + (action + 1.0) * 0.5 * (high - low)
+        return np.clip(scaled_action, low, high)
+
 
 def train_dsunrise(
     experiment_name: str,
@@ -18,6 +43,7 @@ def train_dsunrise(
     env_name: str,
     agent_params: dict,
     updates_per_step: int,
+    inference_type: int,
     seed: int,
     time_steps: int,
     start_steps: int,
@@ -38,10 +64,13 @@ def train_dsunrise(
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-    env = gym.wrappers.RescaleAction(gym.make(env_name), min_action=0, max_action=1)
+    # env = gym.wrappers.RescaleAction(gym.make(env_name), min_action=-1, max_action=1)
+
+    env = NormalizedBoxEnv(gym.make(env_name))
     
     agent = DSUNRISE(
         env=env,
+        inference_type=inference_type,
         **agent_params,
         computation_device=computation_device,
     )
@@ -51,6 +80,9 @@ def train_dsunrise(
         os.makedirs(video_dir, exist_ok=True)
 
     state: np.ndarray = env.reset(seed=seed)[0]
+    episode_actor=None
+    if inference_type == 0:
+        episode_actor = np.random.randint(agent.num_ensemble)
     episode_reward: float = 0.0
     episode_timesteps: int = 0
     episode_num: int = 0
@@ -68,23 +100,40 @@ def train_dsunrise(
     print(f"Device: {computation_device}")
     print(f"Process ID: {os.getpid()}")
     print(f"Running on machine {os.uname().nodename}")
-    print(f"Environment name: {env_name}")
-    print(f"Start time of training: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(training_start_time))}")
-    print(f"Using settings: updates_per_step={updates_per_step}, seed={seed}, time_steps={time_steps}, start_steps={start_steps}, eval_every={eval_every}, exp_dir={exp_dir}, save_model={save_model}, experiment_name={experiment_name}", flush=True)
 
+    table = Table(title="Training settings")
+    table.add_column("Parameter", style="cyan", no_wrap=True)
+    table.add_column("Value", style="magenta")
+
+    params = {
+        "Updates per step": str(updates_per_step),
+        "Seed": str(seed),
+        "Time steps": str(time_steps),
+        "Start steps": str(start_steps),
+        "Eval every": str(eval_every),
+        "Experiment directory": exp_dir,
+        "Save model": str(save_model),
+        "Experiment name": experiment_name,
+    }
+
+    for k, v in params.items():
+        table.add_row(str(k), str(v))
+
+    console = Console()
+    console.print(table)
 
     for frame_idx in range(1, time_steps + 1):
         episode_timesteps += 1
 
         action: np.ndarray
         mask: np.ndarray
-        action, mask = agent.select_action(state)
+        action, mask = agent.select_action(state, episode_actor)
 
         next_state: np.ndarray
         reward: Any
         terminated: bool
         truncated: bool
-        next_state, reward, terminated, truncated, _ = env.step(action[0])
+        next_state, reward, terminated, truncated, _ = env.step(action)
         done: bool = terminated or truncated
 
         # Ensure reward is float
@@ -103,10 +152,12 @@ def train_dsunrise(
             episode_end_time = time.time()
             episode_duration = episode_end_time - episode_start_time
             print(
-                f"Total T: {frame_idx} Episode Num: {episode_num + 1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f} Duration: {episode_duration:.2f}s",
+                f"Total T: {frame_idx} Episode Num: {episode_num + 1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f} Episode Actor: {episode_actor} Duration: {episode_duration:.2f}s",
                  flush=True
             )
             state = env.reset(seed=seed + episode_num + 1)[0]
+            if inference_type == 0:
+                episode_actor = np.random.randint(agent.num_ensemble)
             episode_reward = 0.0
             episode_timesteps = 0
             episode_num += 1
@@ -176,7 +227,8 @@ def evaluate_model(env_name: str, agent: DSUNRISE, seed: int, num_episodes: int=
     eval_env: Optional[gym.Env] = None
     try:
         if video_dir is not None:
-            eval_env = gym.wrappers.RescaleAction(gym.make(env_name, render_mode='rgb_array'), min_action=0, max_action=1)
+            # eval_env = gym.wrappers.RescaleAction(gym.make(env_name, render_mode='rgb_array'), min_action=-1, max_action=1)
+            eval_env = NormalizedBoxEnv(gym.make(env_name, render_mode='rgb_array'), reward_scale=1.0)
             eval_env = gym.wrappers.RecordVideo(
                 eval_env,
                 video_folder=video_dir,
@@ -184,8 +236,9 @@ def evaluate_model(env_name: str, agent: DSUNRISE, seed: int, num_episodes: int=
                 name_prefix=f"eval-{seed}"
             )
         else:
-            eval_env = gym.wrappers.RescaleAction(gym.make(env_name), min_action=0, max_action=1)
-        
+            # eval_env = gym.wrappers.RescaleAction(gym.make(env_name), min_action=-1, max_action=1)
+            eval_env = NormalizedBoxEnv(gym.make(env_name), reward_scale=1.0)
+
         for eval_ep_idx in range(num_episodes):
             eval_state_tuple = eval_env.reset(
                 seed=seed + eval_ep_idx
@@ -275,7 +328,6 @@ if __name__ == "__main__":
         temperature=args.temperature,
         temperature_act=args.temperature_act,
         feedback_type=args.feedback_type,
-        # inference_type=args.inference_type,
         actor_lr=3E-4,
         critic_lr=3E-4,
         entropy_lr=3E-4,
@@ -290,18 +342,13 @@ if __name__ == "__main__":
 
     )
                             
-            
-    # if 'cuda' in args.computation_device:
-    #     ptu.set_gpu_mode(True, gpu_id=args.computation_device[0])
-    # else:
-    #     ptu.set_gpu_mode(False)
-    
     train_dsunrise(
         experiment_name=args.exp_name,
         exp_dir=args.exp_dir,
         env_name=args.env,
         agent_params=agent_params,
         updates_per_step=1,
+        inference_type=args.inference_type,
         seed=args.seed,
         time_steps=int(1E6),
         start_steps=1000,

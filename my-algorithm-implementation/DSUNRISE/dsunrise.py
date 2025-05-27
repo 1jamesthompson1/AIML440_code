@@ -8,8 +8,6 @@ from collections import deque
 from torch.distributions import Normal, kl_divergence
 import torch.nn.functional as F
 
-# from rlkit.torch.sac.policies import TanhGaussianPolicy, MakeDeterministic
-
 import gymnasium as gym
 from rich.table import Table
 from rich.console import Console
@@ -25,7 +23,7 @@ class Transition(NamedTuple):
 
 
 class ReplayBuffer:
-    memory: Deque[Transition]  # Type hint for memory attribute
+    memory: Deque[Transition]
 
     def __init__(self, capacity: int):
         self.memory = deque([], maxlen=capacity)
@@ -118,8 +116,6 @@ class ActorNetwork(Network):
     log_std_linear: nn.Linear
     log_std_min: float
     log_std_max: float
-    action_scale: torch.Tensor
-    action_bias: torch.Tensor
 
     def __init__(
         self,
@@ -139,21 +135,6 @@ class ActorNetwork(Network):
 
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
-
-        # Action scaling to make sure that actions are in the correct range
-        if action_space is not None:
-            self.action_scale = torch.tensor(
-                (action_space.high - action_space.low) / 2.0,
-                dtype=torch.float32,
-                device=self.computation_device,
-            )
-            self.action_bias = torch.tensor(
-                (action_space.high + action_space.low) / 2.0,
-                dtype=torch.float32,
-                device=self.computation_device,
-            )
-        else:
-            raise ValueError("action_space cannot be none")
 
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.hidden_layer_fp(state)
@@ -175,22 +156,21 @@ class ActorNetwork(Network):
             mean_action: Mean action after tanh and scaling.
         """
         # TODO: Reconcile this with the sunrise version
+        # Not quite identical as not using a TanhNormal distrubtion class. Should be computationally the same.
         mean, log_std = self.forward(state)
         std = log_std.exp()
         normal = Normal(mean, std)
         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale + self.action_bias
+        action = torch.tanh(x_t)
         log_prob = normal.log_prob(x_t)
 
-        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
-        mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
+        mean_action = torch.tanh(mean)
         return action, log_prob, mean_action
 
 class SAC_agent:
     def __init__(self, obs_dim, action_space, critic_arch, actor_arch, computation_device, entropy_lr, actor_lr, critic_lr, discount, soft_target_tau, reward_scale, expl_gamma, feedback_type):
-        # TODO: implement feedback_type
 
         self.discount = discount
         self.soft_target_tau = soft_target_tau
@@ -253,31 +233,6 @@ class SAC_agent:
 
 
 
-    # TODO: Figure out what this does
-    def corrective_feedback(self, obs, update_type):
-        """
-        Compute the standard deviation of Q-values for a single SAC agent.
-        Args:
-            obs: Observation tensor.
-            update_type: 0 for actor, 1 for critic.
-        Returns:
-            std_Q: Standard deviation of Q-values.
-        """
-
-        with torch.no_grad():
-            policy_action, _, _ = self.policy.sample(obs)
-            if update_type == 0:  # actor
-                target_Q1 = self.qf1(obs, policy_action)
-                target_Q2 = self.qf2(obs, policy_action)
-            else:  # critic
-                target_Q1 = self.target_qf1(obs, policy_action)
-                target_Q2 = self.target_qf2(obs, policy_action)
-
-            mean_Q = 0.5 * (target_Q1 + target_Q2)
-            var_Q = 0.5 * ((target_Q1 - mean_Q) ** 2 + (target_Q2 - mean_Q) ** 2)
-            std_Q = torch.sqrt(var_Q).detach()
-
-        return std_Q
 
     def update_parameters(
         self,
@@ -292,8 +247,9 @@ class SAC_agent:
         std_Q: torch.Tensor,
         target_update: bool,
     ) -> None:
-        
-
+        # Ensure actions tensor has the correct shape for single-dimensional actions
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(1)
 
         """
         Policy and Alpha Loss
@@ -369,13 +325,14 @@ class SAC_agent:
         for target_param, param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(self.soft_target_tau * param.data + (1.0 - self.soft_target_tau) * target_param.data)
 
-    def get_action(self, obs, eval=False):
+    def get_action(self, obs, deterministic=False):
         sample = self.policy.sample(obs)
 
-        if eval:
-            return sample[2] # Mean of normal distribution
+        # Ensure the returned action has the correct shape for single-dimensional actions
+        if deterministic:
+            return sample[2].squeeze(-1) if sample[2].ndim > 1 else sample[2]
         else:
-            return sample[0] # Sample from Normal distrbution
+            return sample[0].squeeze(-1) if sample[0].ndim > 1 else sample[0]
 
 class DSUNRISE:
     def __init__(
@@ -396,6 +353,7 @@ class DSUNRISE:
         target_update_period: int,
         auto_entropy_tuning: bool,
         feedback_type: int,
+        inference_type: int,
         max_replay_buffer_size: int,
         batch_size: int,
         computation_device: torch.device
@@ -410,6 +368,7 @@ class DSUNRISE:
         self.auto_entropy_tuning = auto_entropy_tuning
         self.computation_device = computation_device
         self.feedback_type = feedback_type
+        self.inference_type = inference_type
     
         self.learners = [
             SAC_agent(env.observation_space.shape[0],
@@ -452,6 +411,7 @@ class DSUNRISE:
             "soft_target_tau": soft_target_tau,
             "target_update_period": target_update_period,
             "auto_entropy_tuning": auto_entropy_tuning,
+            "inference_type": inference_type,
             "feedback_type": feedback_type,
             "max_replay_buffer_size": max_replay_buffer_size,
             "batch_size": batch_size,
@@ -464,6 +424,65 @@ class DSUNRISE:
         console = Console()
         console.print(table)
     
+    # figure out what this does
+    # answer this is finding the std deviation of the of the q value to weight the updates
+    def corrective_feedback(self, obs, update_type):
+        """
+        compute the standard deviation of q-values for a single observation
+        args:
+            obs: observation tensor.
+            update_type: 0 for actor, 1 for critic.
+        returns:
+            std_q: standard deviation of q-values.
+        """
+        std_Q_list = []
+
+        if self.feedback_type in [0,2]:
+            for en_index, learner in enumerate(self.learners):
+                with torch.no_grad():
+                    policy_action, _, _ = learner.policy.sample(obs)
+                    
+                    if update_type == 0: # actor
+                        target_q1 = learner.qf1(obs, policy_action)
+                        target_q2 = learner.qf2(obs, policy_action)
+                    else: # critic
+                        target_q1 = learner.target_qf1(obs, policy_action)
+                        target_q2 = learner.target_qf2(obs, policy_action)
+                    mean_actor_Q = 0.5*(target_q1 + target_q2)
+                    var_Q = 0.5*((target_q1 - mean_actor_Q)**2 + (target_q2 - mean_actor_Q)**2)
+                std_Q_list.append(torch.sqrt(var_Q).detach())
+
+        elif self.feedback_type in [1,3]:
+            mean_q, var_q = None, None
+            l_target_q = []
+            for en_index, learner in enumerate(self.learners):
+                with torch.no_grad():
+                    policy_action, _, _ = learner.policy.sample(obs)
+                    
+                    if update_type == 0: # actor
+                        target_q1 = learner.qf1(obs, policy_action)
+                        target_q2 = learner.qf2(obs, policy_action)
+                    else: # critic
+                        target_q1 = learner.target_qf1(obs, policy_action)
+                        target_q2 = learner.target_qf2(obs, policy_action)
+                    l_target_q.append(target_q1)
+                    l_target_q.append(target_q2)
+                    if en_index == 0:
+                        mean_q = 0.5*(target_q1 + target_q2) / self.num_ensemble
+                    else:
+                        mean_q += 0.5*(target_q1 + target_q2) / self.num_ensemble
+
+            temp_count = 0
+            for target_q in l_target_q:
+                if temp_count == 0:
+                    var_q = (target_q.detach() - mean_q)**2
+                else:
+                    var_q += (target_q.detach() - mean_q)**2
+                temp_count += 1
+            var_q = var_q / temp_count
+            std_Q_list.append(torch.sqrt(var_q).detach())
+        return std_Q_list
+
     def update_parameters(self):
 
         if len(self.memory) < self.batch_size:
@@ -472,14 +491,22 @@ class DSUNRISE:
         
         batch = self.memory.sample(self.batch_size)
         obs = torch.tensor(np.array([t.state for t in batch]), dtype=torch.float32, device=self.computation_device)
-        actions = torch.tensor(np.array([t.action for t in batch]), dtype=torch.float32, device=self.computation_device).squeeze(1)
+        actions = torch.tensor(
+            np.array([t.action for t in batch]),
+            dtype=torch.float32,
+            device=self.computation_device,
+        )
+        # Ensure actions tensor has the correct shape for single-dimensional actions
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(1)
         rewards = torch.tensor(np.array([t.reward for t in batch]), dtype=torch.float32, device=self.computation_device).unsqueeze(1)
         next_obs = torch.tensor(np.array([t.next_state for t in batch]), dtype=torch.float32, device=self.computation_device)
         dones = torch.tensor(np.array([t.done for t in batch]), dtype=torch.float32, device=self.computation_device).unsqueeze(1)
         masks = torch.tensor(np.array([t.mask for t in batch]), dtype=torch.float32, device=self.computation_device)
 
-        std_Q_actor_list = [agent.corrective_feedback(obs, 0) for agent in self.learners]
-        std_Q_critic_list = [agent.corrective_feedback(obs, 1) for agent in self.learners]
+        std_Q_actor_list = self.corrective_feedback(obs, 0)
+        std_Q_critic_list = self.corrective_feedback(next_obs, 1)
+
 
         for i, learner in enumerate(self.learners):
             mask = masks[:,i].reshape(-1, 1)
@@ -578,7 +605,7 @@ class DSUNRISE:
         self.updates += 1
 
 
-    def get_ucb_std(self, obs, policy_action, inference_type, learner) -> torch.Tensor:
+    def get_ucb_std(self, obs, policy_action, learner) -> torch.Tensor:
         obs = obs.reshape(1,-1)
         policy_action = policy_action.reshape(1,-1)
         
@@ -588,7 +615,7 @@ class DSUNRISE:
                 target_Q2 = learner.qf2(obs, policy_action)
             mean_Q = 0.5*(target_Q1.detach() + target_Q2.detach())
             var_Q = 0.5*((target_Q1.detach() - mean_Q)**2 + (target_Q2.detach() - mean_Q)**2)
-            ucb_score = mean_Q + inference_type * torch.sqrt(var_Q).detach()
+            ucb_score = mean_Q + self.inference_type * torch.sqrt(var_Q).detach()
 
         elif self.feedback_type == 1 or self.feedback_type==3:
             mean_Q, var_Q = 0.0, None
@@ -609,7 +636,7 @@ class DSUNRISE:
                     var_Q += (target_Q.detach() - mean_Q)**2
                 temp_count += 1
             var_Q = var_Q / temp_count
-            ucb_score = mean_Q + inference_type * torch.sqrt(var_Q).detach()
+            ucb_score = mean_Q + self.inference_type * torch.sqrt(var_Q).detach()
             
         return ucb_score
 
@@ -624,16 +651,23 @@ class DSUNRISE:
             action: Action tensor.
         """
         obs_tensor = torch.FloatTensor(obs).to(self.computation_device).unsqueeze(0)
+
+        # Set which SAC agents will learn with this transition
+        mask = torch.bernoulli(torch.Tensor([0.5]*self.num_ensemble))
+        if mask.sum() == 0:
+            rand_index = np.random.randint(self.num_ensemble, size=1)
+            mask[rand_index] = 1
+        mask = mask.numpy()
         
         if learner_id is not None:
             learner = self.learners[learner_id]
-            _a, _ = learner.get_action(obs_tensor)
-            return _a
+            _a = learner.get_action(obs_tensor).detach().cpu().numpy()
+            return _a.squeeze(0) if _a.ndim > 1 else _a, mask
 
         actions, ucb_scores = [], []
         for i, learner in enumerate(self.learners):
             _a = learner.get_action(obs_tensor)
-            ucb_score = self.get_ucb_std(obs_tensor, _a, 0, learner)
+            ucb_score = self.get_ucb_std(obs_tensor, _a, learner)
 
             actions.append(_a)
             ucb_scores.append(ucb_score)
@@ -646,13 +680,6 @@ class DSUNRISE:
         else:
             a = stacked_actions[np.argmax(ucb_scores)].squeeze(0)
 
-        # Set which SAC agents will learn with this transition
-        mask = torch.bernoulli(torch.Tensor([0.5]*self.num_ensemble))
-        if mask.sum() == 0:
-            rand_index = np.random.randint(self.num_ensemble, size=1)
-            mask[rand_index] = 1
-        mask = mask.numpy()
 
-        return a.numpy(), mask
-        _
+        return a.squeeze(0).numpy() if a.ndim > 1 else a.numpy(), mask
 
