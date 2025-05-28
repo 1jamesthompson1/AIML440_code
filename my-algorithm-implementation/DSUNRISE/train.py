@@ -61,8 +61,8 @@ def train_dsunrise(
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)  # if using multiple GPUs
         # Potentially add deterministic flags, though they can impact performance
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
 
     # env = gym.wrappers.RescaleAction(gym.make(env_name), min_action=-1, max_action=1)
 

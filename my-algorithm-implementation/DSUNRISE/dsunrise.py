@@ -69,9 +69,14 @@ class Network(nn.Module):
     hidden_layers: List[nn.Linear]
     computation_device: torch.device
 
-    def __init__(self, computation_device):
+    def __init__(self,
+                 computation_device,
+                 init_w_bounds = 3e-3,
+                 init_b_value = 0.1):
         super().__init__()
         self.computation_device = computation_device
+        self.init_w_bounds = init_w_bounds
+        self.init_b_value = init_b_value
 
     def init_hidden_layers(self, input, arch):
         """
@@ -80,7 +85,9 @@ class Network(nn.Module):
         """
         self.hidden_layers = [nn.Linear(input, arch[0], device=self.computation_device)]
         for i,layer_size in enumerate(arch[1:]):
-            self.hidden_layers.append(nn.Linear(self.hidden_layers[i].out_features, layer_size, device=self.computation_device))
+            hl = nn.Linear(self.hidden_layers[i].out_features, layer_size, device=self.computation_device)
+            self.fanin_init(hl.weight)
+            self.hidden_layers.append(hl)
 
     def hidden_layer_fp(self, input):
         """
@@ -91,24 +98,37 @@ class Network(nn.Module):
             x = F.relu(layer(x))
 
         return x
+    
+    def fanin_init(self, tensor):
+        size = tensor.size()
+        if len(size) == 2:
+            fan_in = size[0]
+        elif len(size) > 2:
+            fan_in = np.prod(size[1:])
+        else:
+            raise Exception("Shape must be have dimension at least 2.")
+        bound = 1. / np.sqrt(fan_in)
+        return tensor.data.uniform_(-bound, bound)
 
+    def uniform_init(self, layer):
+        layer.weight.data.uniform_(-self.init_w_bounds, self.init_w_bounds)
+        layer.bias.data.uniform_(-self.init_w_bounds, self.init_w_bounds)
     
 class CriticNetwork(Network):
     output: nn.Linear
 
     def __init__(self, computation_device: torch.device, num_inputs: int, num_actions: int, arch: List[int]):
         super(CriticNetwork, self).__init__(computation_device)
-        self.init_hidden_layers(num_inputs + num_actions, arch) # TODO: Check to see if the intilization of layers is significantly differnet from original
+        self.init_hidden_layers(num_inputs + num_actions, arch)
         self.actor_aware_critic = False
 
         self.output = nn.Linear(self.hidden_layers[-1].out_features, 1, device=self.computation_device)
+        self.uniform_init(self.output)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         x = self.hidden_layer_fp(torch.cat([state, action], 1))
         x = self.output(x)
         return x
-    
-
     
 class ActorNetwork(Network):
     hidden_layers: List[nn.Linear]
@@ -132,6 +152,8 @@ class ActorNetwork(Network):
         self.init_hidden_layers(num_inputs, arch)
         self.mean_linear = nn.Linear(self.hidden_layers[-1].out_features, num_actions, device=self.computation_device)
         self.log_std_linear = nn.Linear(self.hidden_layers[-1].out_features, num_actions, device=self.computation_device)
+        self.uniform_init(self.mean_linear)
+        self.uniform_init(self.log_std_linear)
 
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
@@ -165,7 +187,7 @@ class ActorNetwork(Network):
         log_prob = normal.log_prob(x_t)
 
         log_prob -= torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
+        log_prob = log_prob.sum(-1, keepdim=True)
         mean_action = torch.tanh(mean)
         return action, log_prob, mean_action
 
@@ -231,9 +253,6 @@ class SAC_agent:
             self.policy.parameters(), lr=actor_lr
         )
 
-
-
-
     def update_parameters(
         self,
         obs: torch.Tensor,
@@ -247,10 +266,6 @@ class SAC_agent:
         std_Q: torch.Tensor,
         target_update: bool,
     ) -> None:
-        # Ensure actions tensor has the correct shape for single-dimensional actions
-        if actions.ndim == 1:
-            actions = actions.unsqueeze(1)
-
         """
         Policy and Alpha Loss
         """
@@ -326,13 +341,15 @@ class SAC_agent:
             target_param.data.copy_(self.soft_target_tau * param.data + (1.0 - self.soft_target_tau) * target_param.data)
 
     def get_action(self, obs, deterministic=False):
+        if obs.ndim != 1:
+            raise ValueError(f"Observation must be a 1D numpy array, instead received {obs.shape}")
+
         sample = self.policy.sample(obs)
 
-        # Ensure the returned action has the correct shape for single-dimensional actions
         if deterministic:
-            return sample[2].squeeze(-1) if sample[2].ndim > 1 else sample[2]
+            return sample[2] # Mean of normal distribution
         else:
-            return sample[0].squeeze(-1) if sample[0].ndim > 1 else sample[0]
+            return sample[0] # Sample from Normal distrbution
 
 class DSUNRISE:
     def __init__(
@@ -491,14 +508,7 @@ class DSUNRISE:
         
         batch = self.memory.sample(self.batch_size)
         obs = torch.tensor(np.array([t.state for t in batch]), dtype=torch.float32, device=self.computation_device)
-        actions = torch.tensor(
-            np.array([t.action for t in batch]),
-            dtype=torch.float32,
-            device=self.computation_device,
-        )
-        # Ensure actions tensor has the correct shape for single-dimensional actions
-        if actions.ndim == 1:
-            actions = actions.unsqueeze(1)
+        actions = torch.tensor(np.array([t.action for t in batch]), dtype=torch.float32, device=self.computation_device)
         rewards = torch.tensor(np.array([t.reward for t in batch]), dtype=torch.float32, device=self.computation_device).unsqueeze(1)
         next_obs = torch.tensor(np.array([t.next_state for t in batch]), dtype=torch.float32, device=self.computation_device)
         dones = torch.tensor(np.array([t.done for t in batch]), dtype=torch.float32, device=self.computation_device).unsqueeze(1)
@@ -650,7 +660,7 @@ class DSUNRISE:
         Returns:
             action: Action tensor.
         """
-        obs_tensor = torch.FloatTensor(obs).to(self.computation_device).unsqueeze(0)
+        obs_tensor = torch.FloatTensor(obs).to(self.computation_device)
 
         # Set which SAC agents will learn with this transition
         mask = torch.bernoulli(torch.Tensor([0.5]*self.num_ensemble))
@@ -661,25 +671,22 @@ class DSUNRISE:
         
         if learner_id is not None:
             learner = self.learners[learner_id]
-            _a = learner.get_action(obs_tensor).detach().cpu().numpy()
-            return _a.squeeze(0) if _a.ndim > 1 else _a, mask
+            a = learner.get_action(obs_tensor).detach().cpu()
+        else: 
+            actions, ucb_scores = [], []
+            for i, learner in enumerate(self.learners):
+                _a = learner.get_action(obs_tensor)
+                ucb_score = self.get_ucb_std(obs_tensor, _a, learner)
 
-        actions, ucb_scores = [], []
-        for i, learner in enumerate(self.learners):
-            _a = learner.get_action(obs_tensor)
-            ucb_score = self.get_ucb_std(obs_tensor, _a, learner)
+                actions.append(_a)
+                ucb_scores.append(ucb_score)
 
-            actions.append(_a)
-            ucb_scores.append(ucb_score)
+            stacked_actions = torch.stack(actions, dim=0).detach().cpu()
+            ucb_scores = torch.stack(ucb_scores, dim=0).detach().cpu()
+            
+            if evaluate:
+                a = stacked_actions.mean(dim=0)
+            else:
+                a = stacked_actions[np.argmax(ucb_scores)]
 
-        stacked_actions = torch.stack(actions, dim=0).detach().cpu()
-        ucb_scores = torch.stack(ucb_scores, dim=0).detach().cpu()
-        
-        if evaluate:
-            a = stacked_actions.mean(dim=0).squeeze(0)
-        else:
-            a = stacked_actions[np.argmax(ucb_scores)].squeeze(0)
-
-
-        return a.squeeze(0).numpy() if a.ndim > 1 else a.numpy(), mask
-
+        return a.numpy(), mask
