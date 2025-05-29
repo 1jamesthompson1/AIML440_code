@@ -293,10 +293,9 @@ def parse_args():
     
     # ensemble
     parser.add_argument('--num-ensemble', default=3, type=int)
-    parser.add_argument('--ber-mean', default=0.5, type=float)
     
     # inference
-    parser.add_argument('--inference-type', default=0.0, type=float)
+    parser.add_argument('--inference-type', default=0, type=int)
     parser.add_argument('--feedback-type', default=1, type=int)
     
     # corrective feedback

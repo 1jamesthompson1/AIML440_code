@@ -87,6 +87,7 @@ class Network(nn.Module):
         for i,layer_size in enumerate(arch[1:]):
             hl = nn.Linear(self.hidden_layers[i].out_features, layer_size, device=self.computation_device)
             self.fanin_init(hl.weight)
+            hl.bias.data.fill_(self.init_b_value)
             self.hidden_layers.append(hl)
 
     def hidden_layer_fp(self, input):
@@ -120,7 +121,6 @@ class CriticNetwork(Network):
     def __init__(self, computation_device: torch.device, num_inputs: int, num_actions: int, arch: List[int]):
         super(CriticNetwork, self).__init__(computation_device)
         self.init_hidden_layers(num_inputs + num_actions, arch)
-        self.actor_aware_critic = False
 
         self.output = nn.Linear(self.hidden_layers[-1].out_features, 1, device=self.computation_device)
         self.uniform_init(self.output)
@@ -142,7 +142,6 @@ class ActorNetwork(Network):
         num_inputs: int,
         num_actions: int,
         arch: List[int],
-        action_space: Optional[gym.spaces.Box],
         computation_device: torch.device,
         log_std_min: float = -20,
         log_std_max: float = 2,
@@ -239,7 +238,6 @@ class SAC_agent:
             num_inputs=obs_dim,
             num_actions=action_dim,
             arch=actor_arch,
-            action_space=action_space,
             computation_device=self.computation_device,
         )
 
