@@ -2,7 +2,7 @@
 
 # This is going to be used to run the simple baselines algorithms on an invidual grid task.
 
-cd /home/thompsjame1/code/AIML440_code/running_baseline_experiments
+cd ~/code/AIML440_code/running_baseline_experiments
 
 echo "==Working Directory=="
 pwd
@@ -12,7 +12,7 @@ ls
 echo "==Understanding which algorithm to run=="
 task_id=$(($1-1)) # 0-indexed except that grid system doesnt allow 0 as the task id
 
-needed_tasks=(280 281 287 288 289 291 292 293 294 295 296 297 298 299 300 311 312 313 314 315 316 317 318 319 320 342 346 349 351 355 356 357 358)
+needed_tasks=(291 299 311 312)
 
 task_id=${needed_tasks[$task_id]}
 

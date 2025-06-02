@@ -1,15 +1,10 @@
 #!/bin/bash
 
-cd ~/code/REDQ/experiments
-
+cd ~/code/sunrise
 
 task_id=$(($1-1)) # 0-indexed except that grid system doesnt allow 0 as the task id
 num_seeds=10
-num_algos=3
 num_envs=9
-
-needed_tasks=(22 25 26 28 30 45 46 47 49 50 84 88)
-task_id=${needed_tasks[$task_id]}
 
 runs_per_algo=$(($num_seeds * $num_envs))
 
@@ -20,17 +15,13 @@ envs=("HalfCheetah-v5" "Walker2d-v5" "Humanoid-v5" "Ant-v5" "HumanoidStandup-v5"
 
 selected_env=${envs[$env_index]}
 
+# Augment the log dir to add a subdir that is the env and seed
+log_dir=${OUTPUTDIR}/${selected_env}_${seed}
+
+
 echo " Running ${selected_env} with seed ${seed}"
 
-echo "==Running train_redq_sac.py=="
+echo "==Running sunrise.py=="
 
-# Check if a resume dir was given as second argument
-resume_dir=$2
-if [ -z "$resume_dir" ]; then
-    resume_str=""
-else
-    resume_str="--resume_dir=$resume_dir"
-fi
-
-poetry run python train_redq_sac.py --seed=${seed} --data_dir=$OUTPUTDIR --env=${selected_env} --epochs=500 $resume_str
-echo "==train_redq_sac.py Complete=="
+poetry run python OpenAIGym_SAC/examples/sunrise.py --seed=${seed} --log_dir=${log_dir} --env=${selected_env} --epochs=1000
+echo "==sunrise.py Complete=="

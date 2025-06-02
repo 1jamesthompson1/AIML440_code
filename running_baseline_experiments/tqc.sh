@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd /home/thompsjame1/code/tqc_pytorch
+cd ~/code/tqc_pytorch
 task_id=$(($1-1)) # 0-indexed except that grid system doesnt allow 0 as the task id
 
 # A problem with the initial grid running attmept meant about 2/3 failed. These are the task ids that failed.
