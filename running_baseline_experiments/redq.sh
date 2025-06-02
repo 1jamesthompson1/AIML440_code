@@ -8,7 +8,7 @@ num_seeds=10
 num_algos=3
 num_envs=9
 
-needed_tasks=(22 25 26 28 30 45 46 47 49 50 84 88)
+needed_tasks=(21 24 25 27 29 44 45 46 48 49 83 87)
 task_id=${needed_tasks[$task_id]}
 
 runs_per_algo=$(($num_seeds * $num_envs))

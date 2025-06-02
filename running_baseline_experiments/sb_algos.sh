@@ -12,7 +12,7 @@ ls
 echo "==Understanding which algorithm to run=="
 task_id=$(($1-1)) # 0-indexed except that grid system doesnt allow 0 as the task id
 
-needed_tasks=(291 299 311 312)
+needed_tasks=(279 286 290 298 310 341 345 348 350 354)
 
 task_id=${needed_tasks[$task_id]}
 
