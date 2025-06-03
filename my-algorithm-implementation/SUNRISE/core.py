@@ -1,6 +1,6 @@
 """Core functions of the SUNRISE algorithm."""
 
-import gym
+import gymnasium as gym
 import numpy as np
 import tensorflow as tf
 
@@ -22,13 +22,64 @@ def heuristic_target_entropy(action_space):
     return heuristic_target_entropy
 
 
+class ExpLayer(tf.keras.layers.Layer):
+    """Custom Keras layer to apply tf.exp."""
+    def call(self, inputs):
+        return tf.exp(inputs)
+
+
+class ClipByValueLayer(tf.keras.layers.Layer):
+    """Custom Keras layer to apply tf.clip_by_value."""
+    def __init__(self, min_value, max_value, **kwargs):
+        super().__init__(**kwargs)
+        self.min_value = min_value
+        self.max_value = max_value
+
+    def call(self, inputs):
+        return tf.clip_by_value(inputs, self.min_value, self.max_value)
+
+
+class RandomNormalLayer(tf.keras.layers.Layer):
+    """Custom Keras layer to apply tf.random.normal."""
+    def call(self, inputs):
+        # Ensure inputs are cast to int32 and used as shape
+        shape = tf.cast(inputs, tf.int32)
+        return tf.random.normal(shape)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+
+class ReduceSumLayer(tf.keras.layers.Layer):
+    def __init__(self, axis=1, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = axis
+
+    def call(self, inputs):
+        return tf.reduce_sum(inputs, axis=self.axis)
+
+    def compute_output_shape(self, input_shape):
+        if input_shape[self.axis] is None:
+            return input_shape[:self.axis] + input_shape[self.axis+1:]
+        return tuple([d for i, d in enumerate(input_shape) if i != self.axis])
+
+
+class SoftplusLayer(tf.keras.layers.Layer):
+    """Custom Keras layer to apply tf.nn.softplus."""
+    def call(self, inputs):
+        return tf.nn.softplus(inputs)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+
 def gaussian_likelihood(value, mu, log_std):
     """Calculates value's likelihood under Gaussian pdf."""
     pre_sum = -0.5 * (
-        ((value - mu) / (tf.exp(log_std) + EPS)) ** 2 +
+        ((value - mu) / (ExpLayer()(log_std) + EPS)) ** 2 +
         2 * log_std + np.log(2 * np.pi)
     )
-    return tf.reduce_sum(pre_sum, axis=1)
+    return ReduceSumLayer(axis=1)(pre_sum)
 
 
 def apply_squashing_func(mu, pi, logp_pi):
@@ -39,12 +90,13 @@ def apply_squashing_func(mu, pi, logp_pi):
     in appendix C. This is a more numerically-stable equivalent to Eq 21.
     Try deriving it yourself as a (very difficult) exercise. :)
     """
-    logp_pi -= tf.reduce_sum(
-        2 * (np.log(2) - pi - tf.nn.softplus(-2 * pi)), axis=1)
+    logp_pi -= ReduceSumLayer(axis=1)(
+        2 * (tf.math.log(2.0) - pi - SoftplusLayer()(-2 * pi))
+    )
 
     # Squash those unbounded actions!
-    mu = tf.tanh(mu)
-    pi = tf.tanh(pi)
+    mu = tf.keras.layers.Lambda(lambda x: tf.tanh(x))(mu)
+    pi = tf.keras.layers.Lambda(lambda x: tf.tanh(x))(pi)
     return mu, pi, logp_pi
 
 
@@ -62,6 +114,28 @@ def layer_norm_mlp(hidden_sizes, activation, name=None):
         tf.keras.layers.Activation(tf.nn.tanh),
         mlp(hidden_sizes[1:], activation)
     ], name)
+
+
+class StackLayer(tf.keras.layers.Layer):
+    """Custom Keras layer to apply tf.stack."""
+    def __init__(self, axis, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = axis
+
+    def call(self, inputs):
+        return tf.stack(inputs, axis=self.axis)
+
+class UnstackLayer(tf.keras.layers.Layer):
+    """Custom Keras layer to apply tf.unstack."""
+    def __init__(self, axis, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = axis
+
+    def call(self, inputs):
+        return tf.unstack(inputs, axis=self.axis)
+
+    def compute_output_shape(self, input_shape):
+        return [input_shape[:self.axis] + input_shape[self.axis+1:]]
 
 
 class MLPActorCriticFactory:
@@ -99,9 +173,19 @@ class MLPActorCriticFactory:
         mu = tf.keras.layers.Dense(self._act_dim)(body)
         log_std = tf.keras.layers.Dense(self._act_dim)(body)
 
-        log_std = tf.clip_by_value(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        std = tf.exp(log_std)
-        pi = mu + tf.random.normal(tf.shape(input=mu)) * std
+        # Wrap tf.clip_by_value and tf.exp in custom layers
+        log_std = ClipByValueLayer(LOG_STD_MIN, LOG_STD_MAX)(log_std)
+        std = ExpLayer()(log_std)
+
+        # Compute shape using batch size and action dimension
+        random_noise = tf.keras.layers.Lambda(
+            lambda x: tf.random.normal(shape=(tf.shape(x)[0], self._act_dim))
+        )(mu)
+
+        print(f"Shapes of the items in the computations: mu={mu.shape}, noise={random_noise.shape}, std={std.shape}")
+
+        pi = mu + random_noise * std
+
         logp_pi = gaussian_likelihood(pi, mu, log_std)
 
         mu, pi, logp_pi = apply_squashing_func(mu, pi, logp_pi)
@@ -116,17 +200,16 @@ class MLPActorCriticFactory:
         """Constructs and returns the ensemble of actor models."""
         obs_inputs = tf.keras.Input(shape=(None, self._obs_dim),
                                     batch_size=self._ac_number)
-        mus, pis, logp_pis = [], [], []
-        for obs_input in tf.unstack(obs_inputs, axis=0):
+        outputs = []
+        for i in range(self._ac_number):
+            obs_input = tf.keras.layers.Lambda(lambda x: x[i])(obs_inputs)
             model = self._make_actor()
-            mu, pi, logp_pi = model(obs_input)
-            mus.append(mu)
-            pis.append(pi)
-            logp_pis.append(logp_pi)
+            outputs.append(model(obs_input))
+        mus, pis, logp_pis = zip(*outputs)
         return tf.keras.Model(inputs=obs_inputs, outputs=[
-            tf.stack(mus, axis=0),
-            tf.stack(pis, axis=0),
-            tf.stack(logp_pis, axis=0),
+            StackLayer(axis=0)(mus),
+            StackLayer(axis=0)(pis),
+            StackLayer(axis=0)(logp_pis),
         ])
 
     def _make_critic(self):
@@ -152,10 +235,10 @@ class MLPActorCriticFactory:
         act_inputs = tf.keras.Input(shape=(None, self._act_dim),
                                     batch_size=self._ac_number)
         qs = []
-        for obs_input, act_input in zip(tf.unstack(obs_inputs, axis=0),
-                                        tf.unstack(act_inputs, axis=0)):
+        for obs_input, act_input in zip(UnstackLayer(axis=0)(obs_inputs),
+                                        UnstackLayer(axis=0)(act_inputs)):
             model = self._make_critic()
             q = model([obs_input, act_input])
             qs.append(q)
         return tf.keras.Model(inputs=[obs_inputs, act_inputs],
-                              outputs=tf.stack(qs, axis=0))
+                              outputs=StackLayer(axis=0)(qs))

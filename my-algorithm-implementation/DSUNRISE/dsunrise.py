@@ -25,8 +25,11 @@ class Transition(NamedTuple):
 class ReplayBuffer:
     memory: Deque[Transition]
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, state_dim: int, action_dim: int, ensemble_size: int):
         self.memory = deque([], maxlen=capacity)
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.ensemble_size = ensemble_size
 
     def push(
         self,
@@ -40,17 +43,13 @@ class ReplayBuffer:
         """Save a transition"""
         # Check the format of the inputs
 
-        if not isinstance(state, np.ndarray):
-            raise ValueError("State must be a numpy array")
-        elif state.ndim != 1:
-            raise ValueError(f"State must be a 1D numpy array, instead recieved {state.shape}")
-
-        if not isinstance(action, np.ndarray):
-            raise ValueError("Action must be a numpy array")
-        elif action.ndim != 1:
-            print(action)
-            raise ValueError(f"Action must be a 1D numpy array, instead recieved {action.shape}")
-
+        assert(state.ndim == 1 and state.shape[0]== self.state_dim), f"State dimension mismatch: expected ({self.state_dim},), got {state.shape}"
+        assert(next_state.ndim == 1 and next_state.shape[0] == self.state_dim), f"Next state dimension mismatch: expected ({self.state_dim},), got {next_state.shape}"
+        assert(action.ndim == 1 and action.shape[0] == self.action_dim), f"Action dimension mismatch: expected ({self.action_dim},), got {action.shape}"
+        assert(mask.ndim == 1 and mask.shape[0] == self.ensemble_size), f"Mask dimension mismatch: expected ({self.ensemble_size},), got {mask.shape}"
+        assert(isinstance(done, bool)), "Done must be a boolean value"
+        assert(isinstance(reward, (int, float))), "Reward must be a numeric value"
+         
         self.memory.append(
             Transition(state, action, reward, next_state, done, mask)
         )
@@ -126,7 +125,9 @@ class CriticNetwork(Network):
         self.uniform_init(self.output)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        x = self.hidden_layer_fp(torch.cat([state, action], 1))
+        assert(state.ndim == action.ndim == 2 and state.shape[0] == action.shape[0]), "State and action must be 2D tensors."
+        concat_input = torch.cat([state, action], 1)
+        x = self.hidden_layer_fp(concat_input)
         x = self.output(x)
         return x
     
@@ -148,6 +149,8 @@ class ActorNetwork(Network):
     ):
         super(ActorNetwork, self).__init__(computation_device)
         self.computation_device = computation_device
+        self.num_inputs = num_inputs
+        self.num_actions = num_actions
         self.init_hidden_layers(num_inputs, arch)
         self.mean_linear = nn.Linear(self.hidden_layers[-1].out_features, num_actions, device=self.computation_device)
         self.log_std_linear = nn.Linear(self.hidden_layers[-1].out_features, num_actions, device=self.computation_device)
@@ -178,6 +181,8 @@ class ActorNetwork(Network):
         """
         # TODO: Reconcile this with the sunrise version
         # Not quite identical as not using a TanhNormal distrubtion class. Should be computationally the same.
+        assert(state.ndim == 2 and state.shape[1]== self.num_inputs), f"State shape mismatch: expected (batch_size, {self.num_inputs}), got {state.shape}"
+
         mean, log_std = self.forward(state)
         std = log_std.exp()
         normal = Normal(mean, std)
@@ -191,7 +196,7 @@ class ActorNetwork(Network):
         return action, log_prob, mean_action
 
 class SAC_agent:
-    def __init__(self, obs_dim, action_space, critic_arch, actor_arch, computation_device, entropy_lr, actor_lr, critic_lr, discount, soft_target_tau, reward_scale, expl_gamma, feedback_type):
+    def __init__(self, state_dim, action_space, critic_arch, actor_arch, computation_device, entropy_lr, actor_lr, critic_lr, discount, soft_target_tau, reward_scale, expl_gamma, feedback_type):
 
         self.discount = discount
         self.soft_target_tau = soft_target_tau
@@ -203,40 +208,39 @@ class SAC_agent:
             [self.log_alpha], lr=entropy_lr
         )
         self.feedback_type = feedback_type
-        if feedback_type not in [1,3]:
-            raise ValueError("feedback_type must be 1 or 3 as that is all that is supported for the SAC agent.")
         
         self.computation_device = computation_device
 
-        action_dim = action_space.shape[0]
+        self.action_dim = action_space.shape[0]
+        self.state_dim = state_dim
 
         self.qf1 = CriticNetwork(
             computation_device=self.computation_device,
-            num_inputs=obs_dim,
-            num_actions=action_dim,
+            num_inputs=self.state_dim,
+            num_actions=self.action_dim,
             arch=critic_arch,
         )
         self.qf2 = CriticNetwork(
             computation_device=self.computation_device,
-            num_inputs=obs_dim,
-            num_actions=action_dim,
+            num_inputs=self.state_dim,
+            num_actions=self.action_dim,
             arch=critic_arch,
         )
         self.target_qf1 = CriticNetwork(
             computation_device=self.computation_device,
-            num_inputs=obs_dim,
-            num_actions=action_dim,
+            num_inputs=self.state_dim,
+            num_actions=self.action_dim,
             arch=critic_arch,
         )
         self.target_qf2 = CriticNetwork(
             computation_device=self.computation_device,
-            num_inputs=obs_dim,
-            num_actions=action_dim,
+            num_inputs=self.state_dim,
+            num_actions=self.action_dim,
             arch=critic_arch,
         )
         self.policy = ActorNetwork(
-            num_inputs=obs_dim,
-            num_actions=action_dim,
+            num_inputs=self.state_dim,
+            num_actions=self.action_dim,
             arch=actor_arch,
             computation_device=self.computation_device,
         )
@@ -263,13 +267,15 @@ class SAC_agent:
         weight_target_Q: torch.Tensor,
         std_Q: torch.Tensor,
         target_update: bool,
-    ) -> None:
+    ) -> dict:
         """
         Policy and Alpha Loss
         """
         new_obs_actions, log_prob, _ = self.policy.sample(
             obs
         )
+        assert(new_obs_actions.shape == actions.shape)
+        assert(log_prob.shape == (obs.shape[0], 1)), f"Log probability shape mismatch: expected ({obs.shape[0]}, 1), got {log_prob.shape}"
 
         alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()) * mask
         alpha_loss = alpha_loss.sum() / (mask.sum() + 1)
@@ -297,14 +303,15 @@ class SAC_agent:
         new_next_actions, new_log_pi, _ = self.policy.sample(
             next_obs
         )
+
         target_q_values = torch.min(
             self.target_qf1(next_obs, new_next_actions),
             self.target_qf2(next_obs, new_next_actions),
         ) - alpha * new_log_pi
         
         q_target = self.reward_scale * rewards + (1. - dones) * self.discount * target_q_values
-        qf1_loss = nn.MSELoss(reduce=False)(q1_pred, q_target.detach()) * mask * (weight_target_Q.detach())
-        qf2_loss = nn.MSELoss(reduce=False)(q2_pred, q_target.detach()) * mask * (weight_target_Q.detach())
+        qf1_loss = nn.MSELoss(reduction="none")(q1_pred, q_target.detach()) * mask * (weight_target_Q.detach())
+        qf2_loss = nn.MSELoss(reduction="none")(q2_pred, q_target.detach()) * mask * (weight_target_Q.detach())
         qf1_loss = qf1_loss.sum() / (mask.sum() + 1)
         qf2_loss = qf2_loss.sum() / (mask.sum() + 1)
         
@@ -334,20 +341,42 @@ class SAC_agent:
                 self.qf2, self.target_qf2
             )
 
+        return {
+            "qf1_loss": qf1_loss.item(),
+            "qf2_loss": qf2_loss.item(),
+            "q1_pred": q1_pred.mean().item(),
+            "q2_pred": q2_pred.mean().item(),
+            "q_target": q_target.mean().item(),
+            "policy_loss": policy_loss.item(),
+            "log_pi": log_prob.mean().item(),
+            "alpha": alpha.item(),
+            "alpha_loss": alpha_loss.item(),
+            "actor_weight": weight_actor_Q.mean().item(),
+            "target_weight": weight_target_Q.mean().item(),
+        }
+
     def _soft_update(self, target: nn.Module, source: nn.Module) -> None:
         for target_param, param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(self.soft_target_tau * param.data + (1.0 - self.soft_target_tau) * target_param.data)
 
     def get_action(self, obs, deterministic=False):
-        if obs.ndim != 1:
-            raise ValueError(f"Observation must be a 1D numpy array, instead received {obs.shape}")
+        """
+        Used to get a singleaction from the policy. It will either be a sample from the mean or the mean if deterministic.
+        """
+        assert(obs.ndim==1 and obs.shape[0] == self.policy.num_inputs), f"Observation shape mismatch: expected ({self.policy.num_inputs},), got {obs.shape}"
+
+        obs = obs.unsqueeze(0)
 
         sample = self.policy.sample(obs)
+        for i in [0,2]:
+            assert(sample[i].ndim == 2 and sample[i].shape[0] == 1 and sample[i].shape[1] == self.action_dim), f"Sample shape mismatch: expected (1, {self.action_dim}), got {sample[i].shape}"
 
         if deterministic:
-            return sample[2] # Mean of normal distribution
+            sample = sample[2] # Mean of normal distribution
         else:
-            return sample[0] # Sample from Normal distrbution
+            sample = sample[0] # Sample from Normal distrbution
+
+        return sample.squeeze(0)
 
 class DSUNRISE:
     def __init__(
@@ -384,9 +413,11 @@ class DSUNRISE:
         self.computation_device = computation_device
         self.feedback_type = feedback_type
         self.inference_type = inference_type
+        self.state_dim = env.observation_space.shape[0]
+        self.action_dim = env.action_space.shape[0]
     
         self.learners = [
-            SAC_agent(env.observation_space.shape[0],
+            SAC_agent(self.state_dim,
                       env.action_space,
                       critic_arch,
                       actor_arch,
@@ -403,7 +434,10 @@ class DSUNRISE:
             for _ in range(num_ensemble)
         ]
 
-        self.memory = ReplayBuffer(capacity=max_replay_buffer_size)
+        self.memory = ReplayBuffer(capacity=max_replay_buffer_size, 
+                                   state_dim=self.state_dim,
+                                   action_dim=self.action_dim,
+                                   ensemble_size=num_ensemble)
 
         self.updates = 0
 
@@ -438,6 +472,27 @@ class DSUNRISE:
 
         console = Console()
         console.print(table)
+
+        self.stats_for_logging = {}
+
+    def log_stats(self):
+        """
+        Log the statistics of the DSUNRISE agent.
+        This function will print the statistics of the agent in a table format.
+        """
+        if self.stats_for_logging == {}:
+            return
+        table = Table(title=f"DSUNRISE Statistics at {len(self.memory)}")
+        table.add_column("Parameter", style="cyan", no_wrap=True)
+        table.add_column("Value", style="magenta")
+
+        for key, value in self.stats_for_logging.items():
+            table.add_row(str(key), str(np.mean(value)))
+
+        console = Console()
+        console.print(table)
+
+        self.stats_for_logging = {}  # Reset after logging
     
     # figure out what this does
     # answer this is finding the std deviation of the of the q value to weight the updates
@@ -445,11 +500,14 @@ class DSUNRISE:
         """
         compute the standard deviation of q-values for a single observation
         args:
-            obs: observation tensor.
+            obs: observation tensor of shape (batch_size, obs_dim).
             update_type: 0 for actor, 1 for critic.
         returns:
             std_q: standard deviation of q-values.
         """
+
+        assert(obs.ndim == 2 and obs.shape[1] == self.state_dim), f"Observation shape mismatch: expected (batch_size, {self.state_dim}), got {obs.shape}"
+
         std_Q_list = []
 
         if self.feedback_type in [0,2]:
@@ -496,6 +554,9 @@ class DSUNRISE:
                 temp_count += 1
             var_q = var_q / temp_count
             std_Q_list.append(torch.sqrt(var_q).detach())
+        else:
+            raise ValueError("feedback_type must be 0, 1, 2 or 3.")
+
         return std_Q_list
 
     def update_parameters(self):
@@ -512,16 +573,27 @@ class DSUNRISE:
         dones = torch.tensor(np.array([t.done for t in batch]), dtype=torch.float32, device=self.computation_device).unsqueeze(1)
         masks = torch.tensor(np.array([t.mask for t in batch]), dtype=torch.float32, device=self.computation_device)
 
+        assert(obs.ndim == 2 and obs.shape == (self.batch_size, self.state_dim)), f"Observation shape mismatch: expected ({self.batch_size}, {self.state_dim}), got {obs.shape}"
+        assert(actions.ndim == 2 and actions.shape == (self.batch_size, self.action_dim)), f"Action shape mismatch: expected ({self.batch_size}, {self.action_dim}), got {actions.shape}"
+        assert(rewards.ndim == 2 and rewards.shape == (self.batch_size, 1)), f"Reward shape mismatch: expected ({self.batch_size},1), got {rewards.shape}"
+        assert(next_obs.ndim == 2 and next_obs.shape == (self.batch_size, self.state_dim)), f"Next observation shape mismatch: expected ({self.batch_size}, {self.state_dim}), got {next_obs.shape}"
+        assert(dones.ndim == 2 and dones.shape == (self.batch_size, 1)), f"Done shape mismatch: expected ({self.batch_size},), got {dones.shape}" 
+        assert(masks.ndim == 2 and masks.shape == (self.batch_size, self.num_ensemble)), f"Mask shape mismatch: expected ({self.batch_size}, {self.num_ensemble}), got {masks.shape}"
+
         std_Q_actor_list = self.corrective_feedback(obs, 0)
         std_Q_critic_list = self.corrective_feedback(next_obs, 1)
 
+        update_stats = {}
 
         for i, learner in enumerate(self.learners):
             mask = masks[:,i].reshape(-1, 1)
 
+            assert(mask.ndim == 2 and mask.shape == (self.batch_size, 1)), f"Mask shape mismatch: expected ({self.batch_size}, 1), got {mask.shape}"
+
             if self.feedback_type == 0 or self.feedback_type == 2:
                 std_Q = std_Q_actor_list[i]
             else:
+                assert(len(std_Q_actor_list) == 1), "For feedback_type 1 and 3, std_Q_actor_list should only have one element."
                 std_Q = std_Q_actor_list[0]
 
             if self.feedback_type == 1 or self.feedback_type == 0:
@@ -531,16 +603,16 @@ class DSUNRISE:
 
             if self.feedback_type == 0 or self.feedback_type == 2:
                 if self.feedback_type == 0:
-                    weight_target_Q = torch.sigmoid(-std_Q_critic_list[i]*self.temperature) + 0.5
+                    weight_target_Q = torch.sigmoid(-std_Q*self.temperature) + 0.5
                 else:
-                    weight_target_Q = 2*torch.sigmoid(-std_Q_critic_list[i]*self.temperature)
+                    weight_target_Q = 2*torch.sigmoid(-std_Q*self.temperature)
             else:
                 if self.feedback_type == 1:
-                    weight_target_Q = torch.sigmoid(-std_Q_critic_list[0]*self.temperature) + 0.5
+                    weight_target_Q = torch.sigmoid(-std_Q*self.temperature) + 0.5
                 else:
-                    weight_target_Q = 2*torch.sigmoid(-std_Q_critic_list[0]*self.temperature)
+                    weight_target_Q = 2*torch.sigmoid(-std_Q*self.temperature)
 
-            learner.update_parameters(
+            stats = learner.update_parameters(
                 obs=obs,
                 actions=actions,
                 rewards=rewards,
@@ -552,64 +624,19 @@ class DSUNRISE:
                 weight_actor_Q=weight_actor_Q,
                 std_Q=std_Q
             )
-                
-            """
-            Statistics for log
-            """
-            # tot_qf1_loss += qf1_loss * (1/self.num_ensemble)
-            # tot_qf2_loss += qf2_loss * (1/self.num_ensemble)
-            # tot_q1_pred += q1_pred * (1/self.num_ensemble)
-            # tot_q2_pred += q2_pred * (1/self.num_ensemble)
-            # tot_q_target += q_target * (1/self.num_ensemble)
-            # tot_log_pi += log_pi * (1/self.num_ensemble)
-            # tot_policy_mean += policy_mean * (1/self.num_ensemble)
-            # tot_policy_log_std += policy_log_std * (1/self.num_ensemble)
-            # tot_alpha += alpha.item() * (1/self.num_ensemble)
-            # tot_alpha_loss += alpha_loss.item()
-            # tot_policy_loss = (log_pi - q_new_actions).mean() * (1/self.num_ensemble)
 
-        """
-        Save some statistics for eval
-        """
-        # if self._need_to_update_eval_statistics:
-        #     self._need_to_update_eval_statistics = False
-        #     """
-        #     Eval should set this to None.
-        #     This way, these statistics are only computed for one batch.
-        #     """
-        #     self.eval_statistics['QF1 Loss'] = np.mean(ptu.get_numpy(tot_qf1_loss))
-        #     self.eval_statistics['QF2 Loss'] = np.mean(ptu.get_numpy(tot_qf2_loss))
-        #     self.eval_statistics['Policy Loss'] = np.mean(ptu.get_numpy(
-        #         tot_policy_loss
-        #     ))
-        #     self.eval_statistics.update(create_stats_ordered_dict(
-        #         'Q1 Predictions',
-        #         ptu.get_numpy(tot_q1_pred),
-        #     ))
-        #     self.eval_statistics.update(create_stats_ordered_dict(
-        #         'Q2 Predictions',
-        #         ptu.get_numpy(tot_q2_pred),
-        #     ))
-        #     self.eval_statistics.update(create_stats_ordered_dict(
-        #         'Q Targets',
-        #         ptu.get_numpy(tot_q_target),
-        #     ))
-        #     self.eval_statistics.update(create_stats_ordered_dict(
-        #         'Log Pis',
-        #         ptu.get_numpy(tot_log_pi),
-        #     ))
-        #     self.eval_statistics.update(create_stats_ordered_dict(
-        #         'Policy mu',
-        #         ptu.get_numpy(tot_policy_mean),
-        #     ))
-        #     self.eval_statistics.update(create_stats_ordered_dict(
-        #         'Policy log std',
-        #         ptu.get_numpy(tot_policy_log_std),
-        #     ))
-        #     if self.use_automatic_entropy_tuning:
-        #         self.eval_statistics['Alpha'] = tot_alpha
-        #         self.eval_statistics['Alpha Loss'] = tot_alpha_loss
-                
+            for key, value in stats.items():
+                if key not in update_stats:
+                    update_stats[key] = []
+                    
+                update_stats[key].append(value)
+            
+
+        for key, value in update_stats.items():
+            if key not in self.stats_for_logging:
+                self.stats_for_logging[key] = []
+            self.stats_for_logging[key].append(np.mean(value)) # Average over the ensemble
+
         self.updates += 1
 
 
@@ -658,7 +685,9 @@ class DSUNRISE:
         Returns:
             action: Action tensor.
         """
+        assert(obs.ndim == 1 and obs.shape[0] == self.state_dim), f"Observation shape mismatch: expected ({self.state_dim},), got {obs.shape}"
         obs_tensor = torch.FloatTensor(obs).to(self.computation_device)
+
 
         # Set which SAC agents will learn with this transition
         mask = torch.bernoulli(torch.Tensor([0.5]*self.num_ensemble))
@@ -686,5 +715,7 @@ class DSUNRISE:
                 a = stacked_actions.mean(dim=0)
             else:
                 a = stacked_actions[np.argmax(ucb_scores)]
+
+        assert(a.ndim == 1 and a.shape[0] == self.action_dim), f"Action shape mismatch: expected ({self.action_dim},), got {a.shape}"
 
         return a.numpy(), mask

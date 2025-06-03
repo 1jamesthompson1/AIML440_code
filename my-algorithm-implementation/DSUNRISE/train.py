@@ -21,9 +21,8 @@ class NormalizedBoxEnv(ActionWrapper):
     Normalize actions to be in the range [-1, 1].
     """
 
-    def __init__(self, env: gym.Env, reward_scale: float = 1.0):
+    def __init__(self, env: gym.Env):
         super().__init__(env)
-        self._reward_scale = reward_scale
         # Set the action space to [-1, 1] for all dimensions
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=env.action_space.shape, dtype=np.float32)
 
@@ -51,8 +50,11 @@ def train_dsunrise(
     save_model: bool,
     record_video: bool,
     computation_device: torch.device,
-
+    log_every: int = 1000,
 ):
+    # os.environ["OMP_NUM_THREADS"] = "1"  # Set the number of OpenMP threads
+    # os.environ["MKL_NUM_THREADS"] = "1"  # Set the number of MKL threads
+    torch.set_num_threads(4)  # Set the number of PyTorch threads
 
     random.seed(seed)
     np.random.seed(seed)
@@ -163,6 +165,9 @@ def train_dsunrise(
             episode_num += 1
             episode_start_time = time.time()
 
+        if frame_idx % log_every == 0:
+            agent.log_stats()
+
         if frame_idx % eval_every == 0 and frame_idx >= start_steps:
             print(f"\n--- Evaluation at step {frame_idx} ---")
             evaluation_start_time = time.time()
@@ -228,7 +233,7 @@ def evaluate_model(env_name: str, agent: DSUNRISE, seed: int, num_episodes: int=
     try:
         if video_dir is not None:
             # eval_env = gym.wrappers.RescaleAction(gym.make(env_name, render_mode='rgb_array'), min_action=-1, max_action=1)
-            eval_env = NormalizedBoxEnv(gym.make(env_name, render_mode='rgb_array'), reward_scale=1.0)
+            eval_env = NormalizedBoxEnv(gym.make(env_name, render_mode='rgb_array'))
             eval_env = gym.wrappers.RecordVideo(
                 eval_env,
                 video_folder=video_dir,
@@ -237,7 +242,7 @@ def evaluate_model(env_name: str, agent: DSUNRISE, seed: int, num_episodes: int=
             )
         else:
             # eval_env = gym.wrappers.RescaleAction(gym.make(env_name), min_action=-1, max_action=1)
-            eval_env = NormalizedBoxEnv(gym.make(env_name), reward_scale=1.0)
+            eval_env = NormalizedBoxEnv(gym.make(env_name))
 
         for eval_ep_idx in range(num_episodes):
             eval_state_tuple = eval_env.reset(

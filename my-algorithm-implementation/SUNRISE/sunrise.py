@@ -8,8 +8,42 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-from spinup.algos.tf2.sunrise import core
-from spinup.utils import logx
+import core
+
+
+tf.compat.v1.enable_eager_execution()  # Ensure eager execution is enabled
+
+
+class SimpleLogger:
+    """A simple logger for SUNRISE."""
+    def __init__(self):
+        self.logs = {}
+
+    def save_config(self, config):
+        self.logs['config'] = config
+
+    def store(self, **kwargs):
+        for key, value in kwargs.items():
+            if key not in self.logs:
+                self.logs[key] = []
+            self.logs[key].append(value)
+
+    def log_tabular(self, key, value=None, with_min_and_max=False, average_only=False):
+        if key in self.logs:
+            values = self.logs[key]
+            if with_min_and_max:
+                print(f"{key}: min={min(values)}, max={max(values)}, avg={np.mean(values)}")
+            elif average_only:
+                print(f"{key}: avg={np.mean(values)}")
+            else:
+                print(f"{key}: {values}")
+        elif value is not None:
+            print(f"{key}: {value}")
+
+    def dump_tabular(self):
+        print("Dumping logs...")
+        for key, values in self.logs.items():
+            print(f"{key}: {values}")
 
 
 class ReplayBuffer:
@@ -69,6 +103,8 @@ class ReplayBuffer:
 
 
 def sunrise(
+    exp_dir,
+    exp_name,
     env_fn,
     actor_critic=core.MLPActorCriticFactory,
     ac_kwargs=None,
@@ -87,10 +123,7 @@ def sunrise(
     update_after=1000,
     update_every=50,
     num_test_episodes=10,
-    max_ep_len=1000,
-    logger_kwargs=None,
     save_freq=10_000,
-    save_path=None,
     autotune_alpha=False,
     target_entropy=None,
     alpha_lr=3e-4,
@@ -205,7 +238,7 @@ def sunrise(
             distribution, used for generating masks for the bootstrap.
     """
     pwd = os.getcwd()  # pylint: disable=possibly-unused-variable
-    logger = logx.EpochLogger(**(logger_kwargs or {}))
+    logger = SimpleLogger()
     logger.save_config(locals())
 
     random.seed(seed)
@@ -365,20 +398,18 @@ def sunrise(
             else:
                 value_loss = tf.reduce_mean(masks * (q1_loss + q2_loss))
 
-        # Compute gradients and do updates.
+        # Ensure all variables are properly registered
         actor_gradients = g.gradient(pi_loss, actor.trainable_variables)
         optimizer.apply_gradients(
             zip(actor_gradients, actor.trainable_variables))
-        critic_gradients = g.gradient(value_loss, critic_variables)
+        critic_gradients = g.gradient(value_loss, critic1.trainable_variables + critic2.trainable_variables)
         optimizer.apply_gradients(
-            zip(critic_gradients, critic_variables))
+            zip(critic_gradients, critic1.trainable_variables + critic2.trainable_variables))
 
-        # Polyak averaging for target variables.
-        for v, target_v in zip(critic1.trainable_variables,
-                               target_critic1.trainable_variables):
+        # Polyak averaging for target variables
+        for v, target_v in zip(critic1.trainable_variables, target_critic1.trainable_variables):
             target_v.assign(polyak * target_v + (1 - polyak) * v)
-        for v, target_v in zip(critic2.trainable_variables,
-                               target_critic2.trainable_variables):
+        for v, target_v in zip(critic2.trainable_variables, target_critic2.trainable_variables):
             target_v.assign(polyak * target_v + (1 - polyak) * v)
 
         del g
@@ -393,11 +424,13 @@ def sunrise(
 
     def test_agent():
         for _ in range(num_test_episodes):
-            o, d, ep_ret, ep_len, task_ret = test_env.reset(), False, 0, 0, 0
-            while not (d or (ep_len == max_ep_len)):
+            d, ep_ret, ep_len, task_ret = False, 0, 0, 0
+            o, _ = test_env.reset()
+            while not d:
                 # Take deterministic actions at test time.
-                o, r, d, info = test_env.step(
+                o, r, term, trunc, info = test_env.step(
                     evaluation_policy(tf.convert_to_tensor(o)))
+                d = term or trunc
                 ep_ret += r
                 ep_len += 1
                 task_ret += info.get('reward_task', 0)
@@ -408,7 +441,7 @@ def sunrise(
 
     start_time = time.time()
     iter_begin_time = start_time
-    o, ep_ret, ep_len, task_ret = env.reset(), 0, 0, 0
+    (o, _), ep_ret, ep_len, task_ret = env.reset(), 0, 0, 0
     # Main loop: collect experience in env and update/log each epoch.
     for t in range(total_steps):
         # Until start_steps have elapsed, randomly sample actions
@@ -420,7 +453,8 @@ def sunrise(
             a = env.action_space.sample()
 
         # Step the environment.
-        o2, r, d, info = env.step(a)
+        o2, r, term, trunc, info = env.step(a)
+
         ep_ret += r
         ep_len += 1
         task_ret += info.get('reward_task', 0)
@@ -428,7 +462,7 @@ def sunrise(
         # Ignore the "done" signal if it comes from hitting the time
         # horizon (that is, when it's an artificial terminal signal
         # that isn't based on the agent's state).
-        d = False if ep_len == max_ep_len else d
+        d = term
 
         # Store experience to replay buffer.
         mask = sample_mask()
@@ -439,12 +473,12 @@ def sunrise(
         o = o2
 
         # End of trajectory handling.
-        if d or (ep_len == max_ep_len):
+        if d or trunc:
             logger.store(EpRet=ep_ret,
                          EpLen=ep_len,
                          TaskRet=task_ret,
                          TaskSolved=info.get('is_solved', False))
-            o, ep_ret, ep_len, task_ret = env.reset(), 0, 0, 0
+            (o, _), ep_ret, ep_len, task_ret = env.reset(), 0, 0, 0
 
         # Update handling.
         if t >= update_after and t % update_every == 0:
@@ -514,5 +548,4 @@ def sunrise(
 
         # Save model.
         if ((t + 1) % save_freq == 0) or (t + 1 == total_steps):
-            if save_path is not None:
-                tf.keras.models.save_model(actor, save_path)
+            tf.keras.models.save_model(actor, os.path.join(exp_dir, "model.keras"))
