@@ -32,5 +32,5 @@ else
     resume_str="--resume_dir=$resume_dir"
 fi
 
-poetry run python train_redq_sac.py --seed=${seed} --data_dir=$OUTPUTDIR --env=${selected_env} --epochs=500 $resume_str
+poetry run python train_redq_sac.py --seed=${seed} --data_dir=$OUTPUTDIR --env=${selected_env} --epochs=1000 $resume_str
 echo "==train_redq_sac.py Complete=="
